@@ -18,7 +18,7 @@ import { escalateViaCLI } from './claude-cli.mjs';
 import { cachedCapability, capabilityKey } from './capabilities.mjs';
 import { syntheticSSE } from './stream.mjs';
 import { fitToContext, describeFit } from './fit-context.mjs';
-import { toOllamaRequest, fromOllamaResponse, fromOllamaChunk, NDJSONParser } from './ollama-backend.mjs';
+import { toOllamaRequest, fromOllamaResponse, fromOllamaChunk, newOllamaStreamCursor, NDJSONParser } from './ollama-backend.mjs';
 import { residentContext } from './ollama-admin.mjs';
 
 const MAX_BODY_BYTES = 256 * 1024 * 1024; // Claude Code payloads get large.
@@ -408,6 +408,8 @@ async function relayStream({ cfg, log, counters, req, res, body, route, upstream
     textToolCalls: cfg.textToolCalls,
   });
   const parser = isOllama ? new NDJSONParser() : new SSEParser();
+  // Shared across every line of this response so tool calls keep distinct indices.
+  const ollamaCursor = newOllamaStreamCursor();
   const write = (event) => { if (!res.writableEnded) res.write(serializeSSE(event)); };
 
   let firstTokenMs = null;
@@ -419,7 +421,7 @@ async function relayStream({ cfg, log, counters, req, res, body, route, upstream
         if (payload === '[DONE]') continue;
         if (payload.error) throw new Error(payload.error.message || JSON.stringify(payload.error));
         // Ollama's native stream is NDJSON in its own shape; normalise it.
-        const normalised = isOllama ? fromOllamaChunk(payload) : [payload];
+        const normalised = isOllama ? fromOllamaChunk(payload, ollamaCursor) : [payload];
         for (const p of normalised) events.push(...builder.pushChunk(p));
       }
       for (const e of events) {
@@ -512,9 +514,11 @@ async function escalateThroughCLI({ cfg, log, policy, meter, req, res, body, dec
       shape: Array.isArray(body.tools) && body.tools.length ? 'relay' : 'oracle',
       cwd: cfg.escalationCwd || process.cwd(),
       timeoutMs: cfg.escalationTimeoutMs || 300_000,
-      // One child conversation per outer conversation, so a relayed turn sends
-      // only what is new instead of the whole thread.
-      sessionKey: policy.experimentalRelay === false ? null : TurnAffinity.fingerprint(body),
+      // Persistent child sessions existed to make per-turn relay affordable, and
+      // per-turn relay is gone. What reaches here now is coarse one-shots —
+      // audits, capability fallbacks — which are self-contained by design, so
+      // each gets a fresh child rather than inheriting an earlier one's state.
+      sessionKey: null,
     });
   } catch (err) {
     log.error(`escalation to Claude failed: ${err.message}`);

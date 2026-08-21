@@ -44,6 +44,26 @@ function runAuthStatus({ bin = process.env.BLAUDE_CLAUDE_BIN || 'claude', env = 
 }
 
 /**
+ * The account for this environment as already known on disk, without spawning
+ * anything.
+ *
+ * `readAccount` shells out to `claude auth status` on a miss, which is fine for
+ * a command but not for the guard hook: that runs before every prompt, and a
+ * cold read would stall each one by up to 15s. Identity per config dir barely
+ * changes, so age is not checked here — the TTL exists to re-check whether the
+ * login is still good, and the async path owns that.
+ */
+export function cachedAccount({ env = process.env } = {}) {
+  const configDir = env.CLAUDE_CONFIG_DIR || '(default)';
+  try {
+    const cache = JSON.parse(readFileSync(cacheFile(), 'utf8'));
+    return cache[configDir]?.account ?? null;
+  } catch {
+    return null; // no cache, or a corrupt one, is simply a miss
+  }
+}
+
+/**
  * @returns {Promise<{email:string, orgName:string, subscriptionType:string, key:string, configDir:string}|null>}
  */
 export async function readAccount({ force = false, env = process.env } = {}) {

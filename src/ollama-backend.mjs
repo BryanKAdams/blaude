@@ -116,11 +116,27 @@ export function fromOllamaResponse(body) {
   };
 }
 
+/** Per-stream cursor for {@link fromOllamaChunk}. One per upstream response. */
+export function newOllamaStreamCursor() {
+  return { toolIndex: 0 };
+}
+
 /**
  * One NDJSON line from a streaming /api/chat -> OpenAI-shaped chunk(s).
  * Ollama emits complete tool calls in a single chunk rather than incrementally.
+ *
+ * `cursor` must be shared across every line of one response. The index it hands
+ * out is what the SSE builder keys its per-tool accumulator by, and Ollama is
+ * free to flush two tool calls in two separate lines — so numbering them within
+ * the line would give both index 0. Downstream that reads as ONE tool call whose
+ * argument deltas are the two JSON objects concatenated:
+ *
+ *     {"file_path":"/etc/hosts"}{"command":"uname -a"}
+ *
+ * which is not valid JSON, so the client rejects the parameters and the second
+ * call is lost outright.
  */
-export function fromOllamaChunk(obj) {
+export function fromOllamaChunk(obj, cursor = newOllamaStreamCursor()) {
   const chunks = [];
   const msg = obj?.message || {};
 
@@ -131,7 +147,8 @@ export function fromOllamaChunk(obj) {
     chunks.push({ choices: [{ index: 0, delta: { content: msg.content }, finish_reason: null }] });
   }
   if (msg.tool_calls?.length) {
-    msg.tool_calls.forEach((tc, index) => {
+    msg.tool_calls.forEach((tc) => {
+      const index = cursor.toolIndex++;
       chunks.push({
         choices: [{
           index: 0,

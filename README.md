@@ -50,7 +50,7 @@ Tools still execute in your working directory. Only the model changes.
 ln -s "$PWD/bin/blaude.mjs" ~/.local/bin/blaude   # anywhere on your PATH
 
 blaude use               # list local models, pick one
-blaude route gateway     # keep Blaude in the request path for every session
+blaude route auto        # Claude does the work while you have allowance
 blaude doctor            # backends, tool support, context cap, allowance
 blaude status            # where each kind of request goes right now
 blaude                   # start a session
@@ -72,7 +72,7 @@ spending Claude on. `mode` sets sensible floors; override any of them.
 blaude mode                              # list modes and their floors
 blaude mode claude-first --floor 20%     # Claude until 20% remains, then local
 blaude mode local-first                  # local does the work, Claude audits
-blaude mode split --floor main=35,audit=5
+blaude mode claude-first --floor main=35,audit=5
 ```
 
 | mode | main | tools | audit | background |
@@ -80,7 +80,6 @@ blaude mode split --floor main=35,audit=5
 | `local-only` | local | local | local | local |
 | `local-first` | local | local | Claude to 5% | local |
 | `claude-first` | Claude to 20% | Claude to 20% | Claude to 5% | local |
-| `split` | Claude to 35% | local | Claude to 5% | local |
 
 Requests are classified by what they observably are:
 
@@ -344,9 +343,10 @@ Three things follow, and two of them are unflattering:
 - **Relaying ordinary turns to Claude through Blaude is a bad trade** — roughly
   double the tokens and quadruple the wall clock, because each turn spawns a
   fresh `claude -p` and the outer conversation cannot reuse the prompt cache.
-  A rerun produced no answer at all. So it is off by default
-  (`policy.experimentalRelay`), and ordinary turns stay local with an explanation.
-  For Claude to do the work, run it natively: `blaude route auto` + `blaude guard on`.
+  A rerun produced no answer at all. So there is no switch for it — ordinary
+  turns stay local with an explanation, and an option nobody should enable is not
+  an option, it is a trap. For Claude to do the work, take Blaude out of the
+  request path: `blaude route auto` + `blaude guard on`.
 - **"Local does it, then Claude checks it" is not a token-efficiency play.** It
   cost more than simply asking Claude, because the audit re-reasons about the
   problem. Its value is quality, not savings.

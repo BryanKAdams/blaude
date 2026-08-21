@@ -53,15 +53,19 @@ export const MODES = {
     description: 'Claude does the work until your allowance runs low, then local takes over.',
     floors: { main: 0.2, tools: 0.2, audit: 0.05, background: NEVER },
   },
-  split: {
-    description: 'Claude for thinking, local for the grind, Claude for the audit.',
-    floors: { main: 0.35, tools: NEVER, audit: 0.05, background: NEVER },
-  },
+  // There is no "split" mode — "Claude for thinking, local for the grind" is not
+  // deliverable. With Blaude in the request path, ordinary turns never reach
+  // Claude at all (the relay lost on every measured axis), so a split collapses
+  // to local-only. Out of the path, the session is native and Claude does the
+  // grind too, so it collapses to claude-first. It was the same as claude-first
+  // in both directions while describing something neither one does.
 };
 
 /** Old names kept working, so existing configs do not break. */
 export const MODE_ALIASES = {
   'local-first': 'claude-audits',
+  // Kept resolving so existing configs load; `--floor` overrides still apply.
+  split: 'claude-first',
 };
 
 export function resolveModeName(name) {
@@ -121,17 +125,16 @@ export const DEFAULT_POLICY = {
   //   api -> api.anthropic.com with ANTHROPIC_API_KEY, i.e. metered billing
   cloudTransport: 'cli',
 
-  // Relaying an ORDINARY agent turn through `claude -p` is off by default,
-  // because it measured badly on both axes:
-  //   * ~2x the Claude tokens and ~4x the wall clock of a native session, since
-  //     the outer conversation cannot reuse the prompt cache
-  //   * and it did not reliably finish the task — a benchmark turn came back
-  //     empty, where the same task succeeded natively
+  // There is deliberately no switch to relay ordinary agent turns through
+  // `claude -p`. It was measured against a native session and lost on every
+  // axis: ~2x the Claude tokens, ~4x the wall clock (the outer conversation
+  // cannot reuse the prompt cache), and it did not reliably finish the task — a
+  // benchmark turn came back empty where the same task succeeded natively. An
+  // option nobody should ever enable is not an option, it is a trap.
   //
-  // Coarse one-shots over the same transport (audits, `blaude search`) work
-  // fine, so those are unaffected. For Claude to do ordinary work, run it
-  // natively: `blaude route auto` plus `blaude guard on`.
-  experimentalRelay: false,
+  // Coarse one-shots over the same transport (audits, `blaude search`) measured
+  // fine and are unaffected. For Claude to do ordinary work, take Blaude out of
+  // the request path: `blaude route auto`.
 
   cloudModels: { main: 'sonnet', tools: 'haiku', audit: 'opus', background: 'haiku' },
   localModels: { main: null, tools: null, audit: null, background: 'blaude-small' },
@@ -438,7 +441,13 @@ export class TurnAffinity {
  * @returns {{destination:'local'|'cloud', purpose:string, model:string|null,
  *            reason:string, floor:number, window?:object, capability?:string}}
  */
-export function decide({ policy, meter, body, requestedModel, explicit = null, localCapabilities = {}, affinity = null }) {
+export function decide({
+  policy, meter, body, requestedModel, explicit = null, localCapabilities = {}, affinity = null,
+  // How a cloud destination would actually be served. The gateway must relay the
+  // turn through `claude -p`; the launcher execs `claude` directly and relays
+  // nothing, so the relay's cost has no bearing on its decision.
+  transport = 'relay',
+}) {
   const purpose = classifyRequest(body, { requestedModel });
   const floor = policy.floors?.[purpose] ?? NEVER;
   const candidateModel = policy.cloudModels?.[purpose];
@@ -544,16 +553,19 @@ export function decide({ policy, meter, body, requestedModel, explicit = null, l
   }
 
   // The relay is measurably worse than a native session for ordinary turns, so
-  // it is not used for them unless explicitly enabled.
+  // it is never used for them. This applies only to callers that would actually
+  // relay: a native launch pays none of the cost, and declining it there was
+  // self-defeating — the decline message recommends `blaude route auto`, which
+  // is the very path it was refusing.
   const isOrdinaryTurn = purpose === 'main' || purpose === 'tools';
-  if (isOrdinaryTurn && policy.cloudTransport === 'cli' && !policy.experimentalRelay) {
+  if (isOrdinaryTurn && transport === 'relay' && policy.cloudTransport === 'cli') {
     return {
       ...localFallback,
       relayDeclined: true,
       reason:
-        `${pct(tight.fractionRemaining)} of ${tight.name} allowance left, but relaying an ordinary ` +
-        `turn through the CLI costs ~2x a native session and is unreliable — staying local. ` +
-        `Use \`blaude route auto\` for Claude to do the work, or set policy.experimentalRelay.`,
+        `${pct(tight.fractionRemaining)} of ${tight.name} allowance left, but Blaude is in the request ` +
+        `path, and relaying an ordinary turn through the CLI costs ~2x the tokens and ~4x the wall clock ` +
+        `of a native session — staying local. Run \`blaude route auto\` for Claude to do the work itself.`,
     };
   }
 

@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { AnthropicSSEBuilder, SSEParser, serializeSSE, syntheticSSE } from '../src/stream.mjs';
+import { fromOllamaChunk, newOllamaStreamCursor } from '../src/ollama-backend.mjs';
 
 function collect(chunks, opts = {}) {
   const b = new AnthropicSSEBuilder({ requestedModel: 'blaude', inputTokens: 100, ...opts });
@@ -136,4 +137,69 @@ test('syntheticSSE turns a whole message into a valid sequence', () => {
   });
   assertValidSequence(events);
   assert.equal(events.at(-2).data.delta.stop_reason, 'tool_use');
+});
+
+// ---------------------------------------------------------------------------
+// Ollama tool-call indexing across chunk boundaries
+// ---------------------------------------------------------------------------
+
+/** Reassemble tool_use blocks from a stream the way a client does. */
+function toolBlocks(events) {
+  const blocks = {};
+  for (const { data } of events) {
+    if (data.type === 'content_block_start' && data.content_block?.type === 'tool_use') {
+      blocks[data.index] = { name: data.content_block.name, json: '' };
+    } else if (data.type === 'content_block_delta' && data.delta?.type === 'input_json_delta') {
+      if (blocks[data.index]) blocks[data.index].json += data.delta.partial_json;
+    }
+  }
+  return Object.values(blocks);
+}
+
+function streamOllama(lines) {
+  const cursor = newOllamaStreamCursor();
+  const b = new AnthropicSSEBuilder({ requestedModel: 'blaude', inputTokens: 10 });
+  const events = [];
+  for (const line of lines) {
+    for (const chunk of fromOllamaChunk(line, cursor)) events.push(...b.pushChunk(chunk));
+  }
+  events.push(...b.finish());
+  return toolBlocks(events);
+}
+
+const readCall = { function: { name: 'Read', arguments: { file_path: '/etc/hosts' } } };
+const bashCall = { function: { name: 'Bash', arguments: { command: 'uname -a' } } };
+
+test('two tool calls in one Ollama chunk stay separate', () => {
+  const blocks = streamOllama([{ message: { tool_calls: [readCall, bashCall] } }, { done: true }]);
+  assert.equal(blocks.length, 2);
+  assert.deepEqual(JSON.parse(blocks[0].json), { file_path: '/etc/hosts' });
+  assert.deepEqual(JSON.parse(blocks[1].json), { command: 'uname -a' });
+});
+
+test('two tool calls in SEPARATE chunks stay separate', () => {
+  // Ollama may flush each call on its own NDJSON line. Numbering within the line
+  // gave both index 0, which merged them into one block whose argument deltas
+  // concatenated into `{...}{...}` — invalid JSON, rejected by the client, and
+  // the second call silently dropped.
+  const blocks = streamOllama([
+    { message: { tool_calls: [readCall] } },
+    { message: { tool_calls: [bashCall] } },
+    { done: true },
+  ]);
+  assert.equal(blocks.length, 2, 'calls in separate chunks must not merge');
+  assert.deepEqual(JSON.parse(blocks[0].json), { file_path: '/etc/hosts' });
+  assert.deepEqual(JSON.parse(blocks[1].json), { command: 'uname -a' });
+});
+
+test('every tool block a stream emits carries parseable JSON', () => {
+  const blocks = streamOllama([
+    { message: { tool_calls: [readCall] } },
+    { message: { content: 'thinking about it' } },
+    { message: { tool_calls: [bashCall] } },
+    { message: { tool_calls: [{ function: { name: 'Grep', arguments: { pattern: 'TODO' } } }] } },
+    { done: true },
+  ]);
+  assert.equal(blocks.length, 3);
+  for (const b of blocks) assert.doesNotThrow(() => JSON.parse(b.json), `${b.name}: ${b.json}`);
 });

@@ -21,7 +21,7 @@ import { escalateViaCLI, runClaudeCLI } from './claude-cli.mjs';
 import { simulate, loadHistory } from './simulate.mjs';
 import { detectOllama, loadedContexts, planContextChange, applyStep, waitForOllama, modelMemoryProfile, planMemory, availableMemory } from './ollama-admin.mjs';
 import { listSessions, digestSession, appendNote, readNotes } from './handoff.mjs';
-import { readAccount, describeAccount, portForAccount } from './account.mjs';
+import { readAccount, cachedAccount, describeAccount, portForAccount } from './account.mjs';
 
 const C = {
   bold: (s) => `\x1b[1m${s}\x1b[0m`,
@@ -70,33 +70,74 @@ async function gatewayHealth(cfg, timeoutMs = 1200) {
 }
 
 /**
- * Bind the gateway to this terminal's account.
+ * Bind this process to its own account's gateway port.
  *
- * Allowance belongs to an account, and the gateway reads it once under its own
- * environment. Sharing one gateway between two signed-in accounts routes both on
- * whichever account started it — plausible-looking numbers about the wrong
- * subscription. Each account gets its own port instead.
+ * Allowance belongs to an account, and a gateway reads it once under its own
+ * environment. Share one gateway between two signed-in accounts and both get
+ * routed on whichever account started it — plausible-looking numbers about the
+ * wrong subscription, with no visible symptom beyond work quietly going local.
+ *
+ * This runs once, in `main`, before any command loads config, because doing it
+ * per-command is exactly how the two drifted apart: `status` scoped itself and
+ * nothing else did, so a `serve` started under one account served every other
+ * one on the shared default port. Binding centrally means a call site cannot
+ * forget.
+ *
+ * The port lands in the environment rather than a variable so the detached
+ * `serve` child that `ensureGateway` spawns inherits it too.
  */
+let accountBinding = null;
+export async function bindAccountPort({ env = process.env } = {}) {
+  if (accountBinding) return accountBinding;
+  const cfg = loadConfig({ env });
+
+  // An explicit port, or an opt-out, is the user overriding us on purpose.
+  if (env.BLAUDE_PORT || cfg.accountScopedPort === false) {
+    accountBinding = { account: cachedAccount({ env }), port: cfg.port };
+    return accountBinding;
+  }
+
+  const account = await readAccount({ env }).catch(() => null);
+  const port = portForAccount(cfg.port, account);
+  if (port !== cfg.port) env.BLAUDE_PORT = String(port);
+  accountBinding = { account, port };
+  return accountBinding;
+}
+
+/** Attach the bound account to a freshly loaded config, for display and checks. */
 export async function scopeConfigToAccount(cfg, { quiet = false } = {}) {
   if (cfg.accountScopedPort === false) return cfg;
-  const account = await readAccount().catch(() => null);
-  if (!account) return cfg;
-
-  const port = portForAccount(cfg.port, account);
-  if (port !== cfg.port) {
-    const health = await gatewayHealth(cfg, 600);
-    if (health?.account && health.account.key !== account.key && !quiet) {
-      note(`  ${C.dim(`gateway on ${cfg.port} belongs to ${health.account.email}; using ${port} for ${account.email}`)}`);
-    }
-    cfg.port = port;
-  }
-  cfg.account = account;
+  const { account } = await bindAccountPort();
+  if (account) cfg.account = account;
   return cfg;
 }
 
+/**
+ * A healthy gateway on our port is not automatically ours.
+ *
+ * Per-account ports make a collision unlikely but not impossible — the offset is
+ * a hash modulo 200, and `accountScopedPort: false` disables it outright. Serving
+ * a session from another account's gateway is the failure this whole path exists
+ * to prevent, so refuse it loudly instead of adopting it.
+ */
+export function assertGatewayAccount(health, cfg, account) {
+  const mine = account?.key;
+  const theirs = health?.account?.key;
+  if (!mine || !theirs || mine === theirs) return;
+  throw new Error(
+    `the gateway on ${cfg.host}:${cfg.port} is signed in as ${health.account.email}, not ${account.email}.\n` +
+    `  Its routing comes from that account's allowance, so this session would be sent local (or to Claude)\n` +
+    `  on numbers that are not yours. Stop that gateway, then retry.`,
+  );
+}
+
 async function ensureGateway(cfg, { quiet = false } = {}) {
+  const { account } = await bindAccountPort();
   const existing = await gatewayHealth(cfg);
-  if (existing) return { started: false, health: existing };
+  if (existing) {
+    assertGatewayAccount(existing, cfg, account);
+    return { started: false, health: existing };
+  }
 
   ensureHome();
   const logPath = join(BLAUDE_HOME, 'gateway.log');
@@ -205,6 +246,10 @@ export function localSessionEnv(cfg, { force = false } = {}) {
     ANTHROPIC_SMALL_FAST_MODEL: force ? 'local/blaude-small' : 'blaude-small',
     ANTHROPIC_DEFAULT_HAIKU_MODEL: force ? 'local/blaude-small' : 'blaude-small',
     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
+    // The guard hook checks this to tell "already routed through Blaude" from a
+    // native session. Without it the hook fell back to matching the port, which
+    // now varies per account.
+    BLAUDE_SESSION: 'local',
     ...(window ? { CLAUDE_CODE_MAX_CONTEXT_TOKENS: String(window) } : {}),
   };
 }
@@ -294,10 +339,13 @@ export async function cmdLaunch(argv) {
   // enforced on every request instead of once at launch.
   const alwaysGateway = cfg.launch === 'gateway' && !flags.claude && !flags.cloud;
   const forced = flags.local || alwaysGateway ? 'local' : flags.claude || flags.cloud ? 'cloud' : null;
+  // `transport: 'native'` because a cloud decision here means exec'ing `claude`
+  // with no gateway in the path — the relay's cost never applies to this call.
   const liveDecision = decide({
     policy, meter,
     body: { messages: [{ role: 'user', content: 'session start' }] },
     requestedModel: 'main/session',
+    transport: 'native',
   });
   const decision = forced
     ? {
@@ -314,6 +362,9 @@ export async function cmdLaunch(argv) {
   note('');
   note(`  ${C.bold('Blaude')} ${C.dim('· ' + policy.mode)}`);
   note(`  allowance   ${tight ? `${bar(tight.fractionRemaining)} ${pct(tight.fractionRemaining)} of ${tight.name} left` : C.yellow('not calibrated — run `blaude calibrate`')}`);
+  // This number decides the whole session. Say when it is a guess, the way
+  // `status` does — otherwise an estimate reads exactly like an exact figure.
+  if (meter.lastError) note(`  ${C.yellow('!')} ${C.dim(`estimated — \`claude /usage\` unavailable (${meter.lastError})`)}`);
   if (alwaysGateway) {
     const per = liveDecision.destination === 'cloud'
       ? C.magenta(`Claude ${liveDecision.model}`) + C.dim(' (escalated per request)')
@@ -728,7 +779,7 @@ export async function cmdMode(argv) {
     }
     out('');
     out(`  ${C.dim('blaude mode claude-first --floor 20%      use Claude until 20% of allowance remains')}`);
-    out(`  ${C.dim('blaude mode split --floor main=35,audit=5 per-purpose floors')}`);
+    out(`  ${C.dim('blaude mode claude-first --floor main=35,audit=5  per-purpose floors')}`);
     out('');
     return;
   }
@@ -782,19 +833,19 @@ export async function cmdMode(argv) {
   // A mode that intends Claude to do the work cannot deliver it in every launch
   // configuration. Say so here rather than letting it look like it is working.
   const wantsClaudeForWork = (effective.floors?.main ?? NEVER) < NEVER;
-  const relayOff = effective.cloudTransport === 'cli' && effective.experimentalRelay === false;
+  const relayOnly = effective.cloudTransport === 'cli';
   const inPath = cfg.launch === 'gateway';
 
-  if (wantsClaudeForWork && inPath && relayOff) {
+  if (wantsClaudeForWork && inPath && relayOnly) {
     out('');
     out(`  ${C.yellow('!')} This combination cannot send ordinary turns to Claude.`);
     out(`    ${C.dim(`mode ${mode} wants Claude for main turns, but launch=gateway keeps Blaude in the`)}`);
-    out(`    ${C.dim('request path, and per-turn relay is off because it measured at ~2x the tokens')}`);
-    out(`    ${C.dim('of a native session and did not finish reliably. Ordinary turns stay local.')}`);
+    out(`    ${C.dim('request path, and reaching Claude from there means relaying through the CLI —')}`);
+    out(`    ${C.dim('~2x the tokens and ~4x the wall clock of a native session, and it did not')}`);
+    out(`    ${C.dim('finish reliably. Ordinary turns stay local.')}`);
     out('');
     out(`    For Claude to actually do the work:  ${C.cyan('blaude route auto')}`);
     out(`    ${C.dim('(then `blaude guard on` so a native session still stops at your floor)')}`);
-    out(`    To relay anyway:                     ${C.cyan('policy.experimentalRelay = true')}`);
   }
 
   const meterNow = new AllowanceMeter({ policy: effective });
@@ -1009,7 +1060,7 @@ export async function cmdSimulate(argv) {
     candidates.push(['claude-first @ 20%', buildPolicy(cfg, 'claude-first', '20')]);
     candidates.push(['claude-first @ 10%', buildPolicy(cfg, 'claude-first', '10')]);
     candidates.push(['claude-first @ 0%', buildPolicy(cfg, 'claude-first', '0')]);
-    candidates.push(['split @ 35%', buildPolicy(cfg, 'split', '35')]);
+    candidates.push(['claude-first @ 35%', buildPolicy(cfg, 'claude-first', '35')]);
   }
 
   out(`  ${events.length.toLocaleString()} requests · allotments ` +
@@ -1160,13 +1211,21 @@ export async function cmdHook(argv) {
       setTimeout(resolve, 500);
     });
 
-    // A Blaude-hosted session routes through the gateway already.
+    // A Blaude-hosted session routes through the gateway already. Match the
+    // account's own port as well as the base one, since the two differ now.
     const cfg = loadConfig();
+    const account = cachedAccount();
+    const ourPort = portForAccount(cfg.port, account);
     const base = process.env.ANTHROPIC_BASE_URL || '';
-    if (base.includes(`:${cfg.port}`) || process.env.BLAUDE_SESSION === 'local') emit(null);
+    if (base.includes(`:${ourPort}`) || base.includes(`:${cfg.port}`) || process.env.BLAUDE_SESSION === 'local') emit(null);
+
+    // No identity, no guard. The cache is per account, and blocking a prompt on
+    // another account's exhausted allowance is a worse failure than not guarding
+    // this one — the detached refresh will have written our file by next prompt.
+    if (!account) emit(null);
 
     const policy = normalizePolicy(cfg.policy || {});
-    const report = await readUsageCached({ ttlMs: Number(flags.ttl || 60) * 1000 });
+    const report = await readUsageCached({ ttlMs: Number(flags.ttl || 60) * 1000, accountKey: account.key });
     if (!report?.windows) emit(null);
 
     // Tightest account-wide window, ignoring per-model ones.
@@ -1220,8 +1279,9 @@ export async function cmdHook(argv) {
 /** Warm the usage cache. Spawned detached by the hook; also useful by hand. */
 export async function cmdRefreshUsage() {
   try {
+    const account = await readAccount().catch(() => null);
     const report = await readUsageCommand();
-    writeUsageCache(report);
+    writeUsageCache(report, account?.key ?? null);
     if (process.stdout.isTTY) out(`${C.green('✓')} usage cache refreshed`);
   } catch (err) {
     if (process.stdout.isTTY) out(`${C.yellow('!')} ${err.message}`);
@@ -1699,6 +1759,13 @@ export async function main(argv = process.argv.slice(2)) {
   const [first, ...rest] = argv;
   if (first === '--help' || first === '-h' || first === 'help') return cmdHelp();
   if (first === '--version' || first === '-v') return out('blaude 0.1.0');
+
+  // Every command below reads `loadConfig()`, and the port it returns decides
+  // which gateway this terminal talks to. `hook` is excluded because it runs
+  // before every prompt and resolves its account from cache instead — it cannot
+  // afford the `claude auth status` spawn a cold bind would cost.
+  if (first !== 'hook') await bindAccountPort();
+
   if (first && COMMANDS[first]) return COMMANDS[first](rest);
 
   // `blaude -- anything at all` always means "this is a prompt".

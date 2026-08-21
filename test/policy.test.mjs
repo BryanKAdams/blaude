@@ -62,27 +62,27 @@ test('claude-audits keeps work local and lets audits reach Claude', () => {
 });
 
 test('claude-first falls back exactly at the floor', () => {
-  const policy = normalizePolicy({ mode: 'claude-first', floors: { main: 20 }, experimentalRelay: true });
-  assert.equal(decide({ policy, meter: fakeMeter(0.21), body: freshTurn, requestedModel: 'm' }).destination, 'cloud');
-  assert.equal(decide({ policy, meter: fakeMeter(0.20), body: freshTurn, requestedModel: 'm' }).destination, 'local');
-  assert.equal(decide({ policy, meter: fakeMeter(0.19), body: freshTurn, requestedModel: 'm' }).destination, 'local');
+  const policy = normalizePolicy({ mode: 'claude-first', floors: { main: 20 } });
+  assert.equal(decide({ policy, meter: fakeMeter(0.21), body: freshTurn, requestedModel: 'm' , transport: 'native' }).destination, 'cloud');
+  assert.equal(decide({ policy, meter: fakeMeter(0.20), body: freshTurn, requestedModel: 'm' , transport: 'native' }).destination, 'local');
+  assert.equal(decide({ policy, meter: fakeMeter(0.19), body: freshTurn, requestedModel: 'm' , transport: 'native' }).destination, 'local');
 });
 
 test('reserved tails let audits continue after ordinary work has fallen back', () => {
-  const policy = normalizePolicy({ mode: 'claude-first', floors: { main: 20, tools: 10, audit: 5 }, experimentalRelay: true });
+  const policy = normalizePolicy({ mode: 'claude-first', floors: { main: 20, tools: 10, audit: 5 } });
   const meter = fakeMeter(0.08); // 8% left
-  assert.equal(decide({ policy, meter, body: freshTurn, requestedModel: 'm' }).destination, 'local');
-  assert.equal(decide({ policy, meter, body: loopTurn, requestedModel: 'm' }).destination, 'local');
-  assert.equal(decide({ policy, meter, body: freshTurn, requestedModel: 'audit/opus' }).destination, 'cloud',
+  assert.equal(decide({ policy, meter, body: freshTurn, requestedModel: 'm' , transport: 'native' }).destination, 'local');
+  assert.equal(decide({ policy, meter, body: loopTurn, requestedModel: 'm' , transport: 'native' }).destination, 'local');
+  assert.equal(decide({ policy, meter, body: freshTurn, requestedModel: 'audit/opus' , transport: 'native' }).destination, 'cloud',
     'the audit reserve must still be available');
 });
 
 test('a per-model window blocks only that model', () => {
-  const policy = normalizePolicy({ mode: 'claude-first', floors: { main: 10, audit: 5 }, experimentalRelay: true });
+  const policy = normalizePolicy({ mode: 'claude-first', floors: { main: 10, audit: 5 } });
   // Account-wide is healthy, but the Opus week is spent.
   const meter = fakeMeter(0.9, { perModel: { opus: 0.01 } });
-  assert.equal(decide({ policy, meter, body: freshTurn, requestedModel: 'm' }).destination, 'cloud');
-  assert.equal(decide({ policy, meter, body: freshTurn, requestedModel: 'audit/x' }).destination, 'local',
+  assert.equal(decide({ policy, meter, body: freshTurn, requestedModel: 'm' , transport: 'native' }).destination, 'cloud');
+  assert.equal(decide({ policy, meter, body: freshTurn, requestedModel: 'audit/x' , transport: 'native' }).destination, 'local',
     'an exhausted Opus week must stop an Opus audit');
 });
 
@@ -110,31 +110,31 @@ test('an uncalibrated meter never spends Claude by accident', () => {
 });
 
 test('a turn finishes where it started, and hands off on the next prompt', () => {
-  const policy = normalizePolicy({ mode: 'claude-first', floors: { main: 20, tools: 20 }, experimentalRelay: true });
+  const policy = normalizePolicy({ mode: 'claude-first', floors: { main: 20, tools: 20 } });
   const affinity = new TurnAffinity();
 
   // Turn starts with plenty of allowance.
   let meter = fakeMeter(0.5);
-  assert.equal(decide({ policy, meter, body: freshTurn, requestedModel: 'm', affinity }).destination, 'cloud');
+  assert.equal(decide({ policy, meter, body: freshTurn, requestedModel: 'm', affinity , transport: 'native' }).destination, 'cloud');
 
   // Allowance collapses mid-turn: the loop must stay on Claude.
   meter = fakeMeter(0.15);
-  const mid = decide({ policy, meter, body: loopTurn, requestedModel: 'm', affinity });
+  const mid = decide({ policy, meter, body: loopTurn, requestedModel: 'm', affinity , transport: 'native' });
   assert.equal(mid.destination, 'cloud');
   assert.ok(mid.sticky);
 
   // The next user prompt is where the handoff lands.
   const nextTurn = { messages: [...freshTurn.messages, { role: 'assistant', content: 'done' }, { role: 'user', content: 'next' }] };
-  const after = decide({ policy, meter, body: nextTurn, requestedModel: 'm', affinity });
+  const after = decide({ policy, meter, body: nextTurn, requestedModel: 'm', affinity , transport: 'native' });
   assert.equal(after.destination, 'local');
   assert.equal(after.handoff, 'claude->local');
 });
 
 test('the hard stop breaks turn affinity to protect the remainder', () => {
-  const policy = normalizePolicy({ mode: 'claude-first', floors: { main: 20, tools: 20 }, experimentalRelay: true });
+  const policy = normalizePolicy({ mode: 'claude-first', floors: { main: 20, tools: 20 } });
   const affinity = new TurnAffinity();
   affinity.set(TurnAffinity.fingerprint(loopTurn), 'cloud', 'sonnet');
-  const d = decide({ policy, meter: fakeMeter(0.01), body: loopTurn, requestedModel: 'm', affinity });
+  const d = decide({ policy, meter: fakeMeter(0.01), body: loopTurn, requestedModel: 'm', affinity , transport: 'native' });
   assert.equal(d.destination, 'local');
   assert.equal(d.handoff, 'hard-stop');
 });
@@ -170,6 +170,34 @@ test('every mode preset is coherent', () => {
       assert.ok(rows.every((r) => r.destination === 'local'), 'local-only must never route to Claude');
     }
   }
+});
+
+test('no two modes are the same mode wearing a different description', () => {
+  // `split` promised "Claude for thinking, local for the grind" and delivered
+  // claude-first: in the request path ordinary turns never reach Claude, and out
+  // of it the session is native so Claude does the grind too. A preset that
+  // cannot be told apart from another is a description, not a behaviour.
+  const behaviour = (name) => {
+    const policy = normalizePolicy({ mode: name });
+    return [0.9, 0.5, 0.25, 0.03].flatMap((left) => [
+      decide({ policy, meter: fakeMeter(left), body: freshTurn, requestedModel: 'm' }).destination,
+      decide({ policy, meter: fakeMeter(left), body: loopTurn, requestedModel: 'm' }).destination,
+      decide({ policy, meter: fakeMeter(left), body: freshTurn, requestedModel: 'audit/opus' }).destination,
+      decide({ policy, meter: fakeMeter(left), body: freshTurn, requestedModel: 'm', transport: 'native' }).destination,
+    ]).join(',');
+  };
+
+  const seen = new Map();
+  for (const name of Object.keys(MODES)) {
+    const sig = behaviour(name);
+    assert.ok(!seen.has(sig), `mode "${name}" behaves identically to "${seen.get(sig)}"`);
+    seen.set(sig, name);
+  }
+});
+
+test('a retired mode name still resolves rather than throwing', () => {
+  assert.equal(normalizePolicy({ mode: 'split' }).mode, 'claude-first');
+  assert.equal(normalizePolicy({ mode: 'local-first' }).mode, 'claude-audits');
 });
 
 test('the meter falls back to estimates when /usage cannot be read', async () => {
@@ -233,10 +261,30 @@ test('audits still escalate over the same transport', () => {
   assert.equal(d.destination, 'cloud', 'a coarse one-shot audit is not affected');
 });
 
-test('the relay can be opted into explicitly', () => {
-  const policy = normalizePolicy({ mode: 'claude-first', floors: { main: 0 }, experimentalRelay: true });
-  const d = decide({ policy, meter: fakeMeter(0.9), body: freshTurn, requestedModel: 'm' });
+test('an ordinary turn is never relayed, at any allowance', () => {
+  // There is no flag to turn this back on: the relay measured at ~2x the tokens
+  // and ~4x the wall clock of a native session, and did not finish reliably.
+  const policy = normalizePolicy({ mode: 'claude-first', floors: { main: 0 } });
+  for (const remaining of [0.9, 0.5, 0.99]) {
+    const d = decide({ policy, meter: fakeMeter(remaining), body: freshTurn, requestedModel: 'm' });
+    assert.equal(d.destination, 'local', `${remaining} remaining still must not relay`);
+    assert.ok(d.relayDeclined);
+  }
+});
+
+test('the same turn goes to Claude when the launcher will run it natively', () => {
+  // Same policy, same allowance, different caller: `blaude route auto` execs
+  // `claude` directly, so the relay's cost never applies and declining it there
+  // was self-defeating.
+  const policy = normalizePolicy({ mode: 'claude-first', floors: { main: 20 } });
+  const d = decide({ policy, meter: fakeMeter(0.26), body: freshTurn, requestedModel: 'm', transport: 'native' });
   assert.equal(d.destination, 'cloud');
+  assert.equal(d.model, 'sonnet');
+
+  // The floor still binds — native is not a bypass.
+  const low = decide({ policy, meter: fakeMeter(0.05), body: freshTurn, requestedModel: 'm', transport: 'native' });
+  assert.equal(low.destination, 'local');
+  assert.ok(low.exhausted);
 });
 
 test('the launcher forwards every flag it does not own', () => {
