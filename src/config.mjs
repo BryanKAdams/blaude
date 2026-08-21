@@ -115,30 +115,41 @@ function deepMerge(base, override) {
   return out;
 }
 
-export function configPathCandidates(cwd = process.cwd()) {
-  const paths = [];
-  if (process.env.BLAUDE_CONFIG) paths.push(resolve(process.env.BLAUDE_CONFIG));
-  paths.push(join(cwd, 'blaude.config.json'));
-  paths.push(join(BLAUDE_HOME, 'config.json'));
-  return paths;
+/**
+ * Config files to layer, least specific first.
+ *
+ * BLAUDE_CONFIG is an explicit, standalone choice and stands alone: pointing it
+ * at a test config must not drag your real settings in behind it. Otherwise the
+ * home config is the base and a project file layers over it — "override" in the
+ * sense people mean it. It used to be first-match-wins, so a project file setting
+ * nothing but `policy.mode` silently discarded every model, backend and route you
+ * had configured at home.
+ */
+export function configPathCandidates(cwd = process.cwd(), env = process.env) {
+  if (env.BLAUDE_CONFIG) return [resolve(env.BLAUDE_CONFIG)];
+  return [join(BLAUDE_HOME, 'config.json'), join(cwd, 'blaude.config.json')];
 }
 
 export function loadConfig({ cwd = process.cwd(), env = process.env } = {}) {
   let fileConfig = {};
-  let source = '(defaults)';
-  for (const p of configPathCandidates(cwd)) {
+  const sources = [];
+  for (const p of configPathCandidates(cwd, env)) {
     if (!existsSync(p)) continue;
+    let parsed;
     try {
-      fileConfig = JSON.parse(readFileSync(p, 'utf8'));
-      source = p;
+      parsed = JSON.parse(readFileSync(p, 'utf8'));
     } catch (err) {
       throw new Error(`Blaude config at ${p} is not valid JSON: ${err.message}`);
     }
-    break;
+    fileConfig = deepMerge(fileConfig, parsed);
+    sources.push(p);
   }
 
   const cfg = deepMerge(DEFAULTS, fileConfig);
-  cfg.configSource = source;
+  // Every file that fed this config, most specific last. `configSource` stays a
+  // single path because things watch it; `configSources` is the whole stack.
+  cfg.configSources = sources;
+  cfg.configSource = sources.at(-1) || '(defaults)';
 
   // Env overrides win over the file so one-off runs stay easy.
   if (env.BLAUDE_PORT) cfg.port = Number(env.BLAUDE_PORT);

@@ -71,15 +71,24 @@ spending Claude on. `mode` sets sensible floors; override any of them.
 ```bash
 blaude mode                              # list modes and their floors
 blaude mode claude-first --floor 20%     # Claude until 20% remains, then local
-blaude mode local-first                  # local does the work, Claude audits
+blaude mode claude-audits                # local does the work, Claude audits
 blaude mode claude-first --floor main=35,audit=5
+blaude mode claude-first --floor audit=never
 ```
 
 | mode | main | tools | audit | background |
 |---|---|---|---|---|
 | `local-only` | local | local | local | local |
-| `local-first` | local | local | Claude to 5% | local |
+| `claude-audits` | local | local | Claude to 5% | local |
 | `claude-first` | Claude to 20% | Claude to 20% | Claude to 5% | local |
+
+`claude-audits` was called `local-first`; the old name still resolves, because it
+read as "prefer local, fall back to Claude automatically", which is not what it
+does — every turn is local and Claude is reachable only for review.
+
+Floors take `20`, `0.2` or `"20%"`, and `never` (or `1`) to keep a purpose local
+always. Write single digits with the percent sign — a bare `1` is the "never"
+sentinel, so `--floor audit=1%` and `--floor audit=1` mean opposite things.
 
 Requests are classified by what they observably are:
 
@@ -255,13 +264,15 @@ local, `cloud/opus` forces Claude, `audit/opus` classifies as an audit.
 
 ## Configuration
 
-`~/.blaude/config.json`, or `./blaude.config.json` for a per-project override.
-See `blaude.config.example.json` for every field with commentary.
+`~/.blaude/config.json` is the base; `./blaude.config.json` layers over it, so a
+project file need only name what it changes. `BLAUDE_CONFIG` replaces both, so an
+isolated config stays isolated. See `blaude.config.example.json` for every field
+with commentary.
 
 ## Development
 
 ```bash
-npm test        # 76 tests, no network, no dependencies
+npm test        # no network, no dependencies
 ```
 
 Zero runtime dependencies; Node ≥ 20. The pieces:

@@ -124,8 +124,13 @@ export function fitToContext(body, {
   report.orphanResultsDemoted = orphans;
 
   // 3. Trim tool descriptions to their first line. Claude Code ships long ones.
+  //
+  // `total()` already counts toolTokens, so the guard here must not add them
+  // again: doing so trimmed every description on requests the earlier steps had
+  // already brought under budget, throwing away the documentation the model needs
+  // to call its tools while thousands of tokens of room sat unused.
   let tools = body.tools;
-  if (total() + toolTokens > budget && Array.isArray(tools) && tools.length) {
+  if (total() > budget && Array.isArray(tools) && tools.length) {
     tools = tools.map((t) => {
       const first = String(t.description || '').split('\n')[0];
       if (first.length < String(t.description || '').length) report.trimmedTools++;

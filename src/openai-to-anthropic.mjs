@@ -9,7 +9,12 @@ export const newToolUseId = () => `toolu_blaude_${randomBytes(12).toString('hex'
 export function estimateTokens(value) {
   if (value == null) return 0;
   const text = typeof value === 'string' ? value : JSON.stringify(value);
-  return Math.max(1, Math.ceil(text.length / 3.6));
+  return tokensFromChars(text.length);
+}
+
+/** The same estimate for callers that counted characters as they went. */
+export function tokensFromChars(chars) {
+  return Math.max(1, Math.ceil(chars / 3.6));
 }
 
 export function mapStopReason(finishReason, { sawToolUse = false } = {}) {

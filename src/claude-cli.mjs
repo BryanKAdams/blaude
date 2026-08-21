@@ -201,7 +201,9 @@ export function runClaudeCLI({
   const args = ['-p', '--output-format', 'json', '--model', model];
   if (lean) args.push(...leanFlags());
   if (appendSystemPrompt) args.push('--append-system-prompt', appendSystemPrompt);
-  // An empty allow-list plus a deny-all keeps the child from touching the repo.
+  // An empty allow-list falls back to denying everything that writes or executes.
+  // Read, Glob and Grep stay available: the child is answering a question about
+  // the caller's work and needs to be able to look at it.
   if (allowedTools.length) args.push('--allowedTools', ...allowedTools);
   else args.push('--disallowedTools', 'Bash', 'Edit', 'Write', 'NotebookEdit', 'WebFetch', 'WebSearch');
   args.push(...extraArgs);
@@ -265,6 +267,11 @@ export async function escalateViaCLI(body, {
   const existing = sessionKey ? relaySessionState(sessionKey) : null;
   let result = null;
   let reused = false;
+  // Held onto so the usage fallback at the bottom has the text we actually sent.
+  // It used to reach for `prompt`, which is a parameter of runClaudeCLI and not of
+  // this function, so any CLI reply without a `usage` block threw a ReferenceError
+  // — after Claude had answered and the tokens had already been spent.
+  let sentPrompt = '';
 
   // Two shapes reach here. A relayed agent turn grows one message array, so the
   // delta starts where we left off. A per-turn reviewer hands us a fresh
@@ -277,8 +284,9 @@ export async function escalateViaCLI(body, {
 
   if (existing) {
     try {
+      sentPrompt = renderDelta(body, deltaFrom, { includeTools });
       result = await runClaudeCLI({
-        prompt: renderDelta(body, deltaFrom, { includeTools }),
+        prompt: sentPrompt,
         model, appendSystemPrompt, cwd, timeoutMs, bin, env, lean,
         extraArgs: ['--resume', existing.sessionId],
       });
@@ -292,8 +300,9 @@ export async function escalateViaCLI(body, {
 
   if (!result) {
     const sessionId = randomUUID();
+    sentPrompt = renderConversation(body, { includeTools });
     result = await runClaudeCLI({
-      prompt: renderConversation(body, { includeTools }),
+      prompt: sentPrompt,
       model, appendSystemPrompt, cwd, timeoutMs, bin, env, lean,
       extraArgs: sessionKey ? ['--session-id', sessionId] : [],
     });
@@ -329,7 +338,7 @@ export async function escalateViaCLI(body, {
       stop_reason: scanned.toolCalls.length ? 'tool_use' : 'end_turn',
       stop_sequence: null,
       usage: {
-        input_tokens: u.input_tokens ?? estimateTokens(prompt),
+        input_tokens: u.input_tokens ?? estimateTokens(sentPrompt),
         output_tokens: u.output_tokens ?? estimateTokens(result.text),
         cache_creation_input_tokens: u.cache_creation_input_tokens ?? 0,
         cache_read_input_tokens: u.cache_read_input_tokens ?? 0,

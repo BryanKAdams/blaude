@@ -72,6 +72,37 @@ export function resolveModeName(name) {
   return MODE_ALIASES[name] || name;
 }
 
+/**
+ * Read a floor the way people write them: 0.2, 20, "20%", "never", null.
+ *
+ * The `%` carries meaning and must survive to here. A bare number above 1 reads
+ * as a percentage and a bare number at or below 1 reads as a fraction, which
+ * leaves no bare spelling for one percent — `1` has to keep meaning NEVER,
+ * because that is what every mode preset and every config `blaude init` writes
+ * uses. So "1%" is the spelling for one percent, and it is honoured as one
+ * percent instead of collapsing onto the sentinel and silently switching Claude
+ * off. Anything that means "never" can also say so in words.
+ */
+export function parseFloor(value) {
+  if (value == null || value === false) return NEVER;
+  if (typeof value === 'string') {
+    const s = value.trim().toLowerCase();
+    if (s === 'never' || s === 'local' || s === 'off') return NEVER;
+    if (s.endsWith('%')) {
+      const percent = Number(s.slice(0, -1));
+      if (!Number.isFinite(percent)) throw new Error(`"${value}" is not a percentage`);
+      return percent / 100;
+    }
+    const n = Number(s);
+    if (!Number.isFinite(n)) throw new Error(`"${value}" is not a number, a percentage, or "never"`);
+    return n > 1 ? n / 100 : n;
+  }
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    throw new Error(`expected a number, a percentage or "never", got ${JSON.stringify(value)}`);
+  }
+  return value > 1 ? value / 100 : value;
+}
+
 export const DEFAULT_POLICY = {
   mode: 'claude-audits',
 
@@ -197,9 +228,10 @@ export function normalizePolicy(input = {}) {
     if (!PURPOSES.includes(purpose)) {
       throw new Error(`Floor set for unknown purpose "${purpose}". Known: ${PURPOSES.join(', ')}`);
     }
-    // "20" and "0.2" and "20%" all mean the same thing.
-    let v = typeof value === 'string' ? Number(String(value).replace('%', '')) : value;
-    if (v > 1) v /= 100;
+    let v;
+    try { v = parseFloor(value); } catch (err) {
+      throw new Error(`Floor for "${purpose}": ${err.message}`);
+    }
     if (!(v >= 0 && v <= 1)) throw new Error(`Floor for "${purpose}" must be between 0 and 100%, got ${value}`);
     floors[purpose] = v;
   }

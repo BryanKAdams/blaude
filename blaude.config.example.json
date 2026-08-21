@@ -26,13 +26,13 @@
   ],
 
   "policy": {
-    "//mode": "local-only | local-first | claude-first | split",
+    "//mode": "local-only | claude-audits | claude-first. The old names local-first and split still resolve.",
     "mode": "claude-first",
 
     "//source": "usage-command reads exact percentages from `claude /usage` (free). claude-code estimates from transcripts. gateway counts only what Blaude forwarded.",
     "source": "usage-command",
 
-    "//floors": "Minimum allowance that must REMAIN for this purpose to use Claude. 1 (or 100) means never. Accepts 20, 0.2 or \"20%\".",
+    "//floors": "Minimum allowance that must REMAIN for this purpose to use Claude. Accepts 20, 0.2 or \"20%\". \"never\" (or a bare 1, or 100) means never — so write one percent as \"1%\", never as 1.",
     "floors": {
       "main": 20,
       "tools": 10,

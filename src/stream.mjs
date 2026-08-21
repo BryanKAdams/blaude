@@ -8,7 +8,7 @@
 //
 // Blocks are opened lazily, and a tool block always closes before the next one
 // opens, so index ordering stays monotonic.
-import { newMessageId, newToolUseId, estimateTokens, mapStopReason } from './openai-to-anthropic.mjs';
+import { newMessageId, newToolUseId, tokensFromChars, mapStopReason } from './openai-to-anthropic.mjs';
 import { TextScanner } from './text-scanner.mjs';
 
 export class AnthropicSSEBuilder {
@@ -234,7 +234,7 @@ export class AnthropicSSEBuilder {
     }
 
     const outputTokens = this.usage?.completion_tokens
-      ?? estimateTokens('x'.repeat(this.outputChars + this.toolArgChars));
+      ?? tokensFromChars(this.outputChars + this.toolArgChars);
 
     events.push(
       {
@@ -260,7 +260,7 @@ export class AnthropicSSEBuilder {
     return {
       inputTokens: this.usage?.prompt_tokens ?? this.inputTokens,
       outputTokens: this.usage?.completion_tokens
-        ?? estimateTokens('x'.repeat(this.outputChars + this.toolArgChars)),
+        ?? tokensFromChars(this.outputChars + this.toolArgChars),
       sawToolUse: this.sawToolUse,
       stopReason: mapStopReason(this.finishReason, { sawToolUse: this.sawToolUse }),
     };
@@ -279,6 +279,12 @@ export function serializeSSE(event) {
 /** Incremental parser for an upstream OpenAI SSE byte stream. */
 export class SSEParser {
   constructor() { this.buf = ''; }
+  /** A final event that arrived without its blank-line terminator. */
+  flush() {
+    const rest = this.buf;
+    this.buf = '';
+    return rest.trim() ? this.push(`${rest}\n\n`) : [];
+  }
   /** @returns {Array<object|'[DONE]'>} */
   push(text) {
     this.buf += text;

@@ -1,13 +1,13 @@
 // The `blaude` command line.
 import { spawn, spawnSync } from 'node:child_process';
-import { writeFileSync, existsSync, readFileSync, openSync } from 'node:fs';
+import { writeFileSync, existsSync, readFileSync, openSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { totalmem } from 'node:os';
 import { loadConfig, BLAUDE_HOME, ensureHome, DEFAULTS } from './config.mjs';
 import { startGateway } from './server.mjs';
 import {
   normalizePolicy, AllowanceMeter, decide, explainPolicy, MODES, MODE_ALIASES,
-  resolveModeName, PURPOSES, pct, fmt, NEVER, PERIOD_MS,
+  resolveModeName, PURPOSES, pct, fmt, NEVER, PERIOD_MS, parseFloor,
 } from './policy.mjs';
 import {
   claudeUsageReport, readClaudeEvents, peakWindow, DEFAULT_WEIGHTS,
@@ -254,6 +254,20 @@ export function localSessionEnv(cfg, { force = false } = {}) {
   };
 }
 
+/**
+ * Variables a Blaude-hosted session sets that must not survive into a native one.
+ *
+ * Credentials are deliberately absent: clearing those would change how a native
+ * session authenticates, which is not this function's call to make.
+ */
+export function localSessionEnvKeys(cfg) {
+  return [...new Set([
+    ...Object.keys(localSessionEnv(cfg)).filter((k) => !/API_KEY|AUTH_TOKEN/.test(k)),
+    // Omitted from the object itself on a small window, so name it explicitly.
+    'CLAUDE_CODE_MAX_CONTEXT_TOKENS',
+  ])];
+}
+
 /** True when the local window is too small for Claude Code's compaction to help. */
 export function needsCompactionGuard(cfg) {
   const maxContext = cfg.models[cfg.defaultModel]?.maxContext || 0;
@@ -269,10 +283,10 @@ export function needsCompactionGuard(cfg) {
  * policy. The floor for the purpose applies, and `--force` is the deliberate
  * override.
  */
-async function assertAllowance(purpose, { force = false, label = purpose } = {}) {
+async function assertAllowance(purpose, { force = false, label = purpose, floor: override = null, remedy = null } = {}) {
   const cfg = loadConfig();
   const { policy, meter } = await meterFor(cfg);
-  const floor = policy.floors?.[purpose] ?? NEVER;
+  const floor = override ?? policy.floors?.[purpose] ?? NEVER;
   const tight = meter.tightestFor(policy.cloudModels?.[purpose]);
 
   if (force) {
@@ -286,10 +300,13 @@ async function assertAllowance(purpose, { force = false, label = purpose } = {})
     const why = floor >= NEVER
       ? `mode "${policy.mode}" keeps ${purpose} local`
       : `${pct(tight.fractionRemaining)} of your ${tight.name} allowance is left, at or below the ${pct(floor)} floor for ${purpose}`;
+    // `=1%`, not `=1`. A bare 1 is the "never" sentinel, so the old wording told
+    // people to type the one value guaranteed to reproduce this same error.
+    const fix = remedy || `lower the floor: blaude mode ${policy.mode} --floor ${purpose}=1%`;
     throw new Error(
       `${label} would spend Claude, but ${why}.\n` +
       `  ${tight.resetsAt ? `Allowance resets ${tight.resetsAt}.\n  ` : ''}` +
-      `Override with --force, or lower the floor: blaude mode ${policy.mode} --floor ${purpose}=1`,
+      `Override with --force, or ${fix}`,
     );
   }
   return { policy, meter, tight };
@@ -385,8 +402,13 @@ export async function cmdLaunch(argv) {
 
   if (decision.destination === 'cloud') {
     // Native Claude session: no interception, so prompt caching stays intact.
-    delete env.ANTHROPIC_BASE_URL;
-    delete env.ANTHROPIC_MODEL;
+    //
+    // Clear everything a Blaude-hosted session sets, not just the base URL. An
+    // inherited ANTHROPIC_SMALL_FAST_MODEL would point this session's background
+    // calls at "blaude-small" with no gateway to serve it, and an inherited
+    // BLAUDE_SESSION would tell the guard hook to stand down on the one path it
+    // is there to protect.
+    for (const key of localSessionEnvKeys(cfg)) delete env[key];
     if (decision.model) args.unshift('--model', decision.model);
   } else {
     await ensureGateway(cfg);
@@ -486,16 +508,39 @@ export async function cmdUse(argv) {
   // clamps to OLLAMA_CONTEXT_LENGTH and then again to available memory, so
   // recording the model's 262k would leave the context fitter thinking it has
   // room it does not have — and the daemon would truncate silently instead.
-  const daemonCap = Number(detectOllama().launchctlValue || detectOllama().envValue || 0) || null;
+  //
+  // Deducing it from the daemon cap only works when a cap is set. With
+  // OLLAMA_CONTEXT_LENGTH unset — the out-of-the-box state — there was nothing to
+  // clamp against, so the advertised maximum went straight into the config and
+  // the fitter spent every request believing in room the daemon would never give
+  // it. So ask instead of deducing: load the model and read back what /api/ps
+  // says was actually allocated.
+  const detected = detectOllama();
+  const daemonCap = Number(detected.launchctlValue || detected.envValue || 0) || null;
   const modelMax = info.contextLength || null;
-  const window = Number(
-    flags.context
+  // `--context` with no value parses as `true`, and Number(true) is 1.
+  const asked = Number(flags.context) > 0 ? Number(flags.context) : null;
+  const deduced = Number(
+    asked
     || Math.min(...[modelMax, daemonCap].filter(Boolean))
     || cfg.models[cfg.defaultModel]?.maxContext
     || 32768,
   );
+
+  let measured = null;
+  if (backend.kind === 'ollama' && !flags['no-measure']) {
+    out(`  ${C.dim(`loading ${match.name} to measure the context Ollama really allocates…`)}`);
+    measured = await measureAllocatedContext(backend, match.name, deduced).catch(() => null);
+  }
+
+  // An explicit --context is the user overriding us, so it still wins; the
+  // measurement then serves as a warning rather than a veto.
+  const window = asked || measured || deduced;
   const small = flags.small || match.name;
   const smallInfo = small === match.name ? info : await describe(small);
+  const smallWindow = small === match.name
+    ? window
+    : asked || Math.min(...[smallInfo.contextLength, daemonCap, window].filter(Boolean)) || window;
 
   const patch = {
     models: {
@@ -503,7 +548,7 @@ export async function cmdUse(argv) {
       'blaude-small': {
         backend: backendName,
         model: small,
-        maxContext: Number(flags.context || smallInfo.contextLength || window),
+        maxContext: smallWindow,
         maxOutput: 4096,
       },
     },
@@ -513,12 +558,23 @@ export async function cmdUse(argv) {
 
   out('');
   out(`  ${C.green('✓')} Blaude now serves ${C.cyan(match.name)} ${C.dim(`(${(match.size / 1e9).toFixed(1)} GB, ${match.details?.quantization_level || '?'})`)}`);
-  const capNote = flags.context
+  const capNote = asked
     ? '(you set it)'
-    : daemonCap && modelMax && daemonCap < modelMax
-      ? `(daemon cap; this model can do ${modelMax.toLocaleString()})`
-      : modelMax ? "(the model's own maximum)" : '(from your config)';
+    : measured
+      ? `(measured from /api/ps${modelMax && measured < modelMax ? `; this model can do ${modelMax.toLocaleString()}` : ''})`
+      : daemonCap && modelMax && daemonCap < modelMax
+        ? `(daemon cap; this model can do ${modelMax.toLocaleString()})`
+        : modelMax ? `(the model's advertised maximum — unverified)` : '(from your config)';
   out(`  context      ${window.toLocaleString()} tokens ${C.dim(capNote)}`);
+  const target = asked || deduced;
+  if (measured && measured < target) {
+    out(`  ${C.yellow('!')} Ollama allocated ${measured.toLocaleString()} tokens, not the ${target.toLocaleString()} asked for — it sizes`);
+    out(`    ${C.dim('context to fit memory, and truncates the overflow in silence.')}`);
+    out(`    ${C.dim('Unload other models, or raise the cap:')} ${C.cyan(`blaude ollama context ${target} --apply`)}`);
+  } else if (!measured) {
+    out(`  ${C.yellow('!')} Could not measure what Ollama really allocates, so this figure is unverified.`);
+    out(`    ${C.dim('Confirm it before trusting it:')} ${C.cyan('blaude doctor')}`);
+  }
   if (info.capabilities?.length) {
     const hasTools = info.capabilities.includes('tools');
     out(`  capabilities ${info.capabilities.join(', ')} ${hasTools ? '' : C.red('— no tool support, which a coding agent needs')}`);
@@ -530,6 +586,36 @@ export async function cmdUse(argv) {
   out(`  ${C.dim('gets the whole window:')} ${C.cyan(`ollama stop ${current || '<old model>'}`)}`);
   out(`  ${C.dim('then verify with')} ${C.cyan('blaude doctor')}`);
   out('');
+}
+
+/**
+ * Load a model and ask Ollama what context it actually allocated.
+ *
+ * The advertised maximum is a ceiling Ollama will not hand you: it clamps to
+ * OLLAMA_CONTEXT_LENGTH and then again to free memory, and it truncates the
+ * overflow from the FRONT rather than erroring — taking the system prompt and
+ * tool definitions with it. One throwaway generation turns a guess into a
+ * measurement, and the model has to load for the next real request anyway.
+ */
+async function measureAllocatedContext(backend, model, numCtx, { timeoutMs = 240_000 } = {}) {
+  const base = backend.baseUrl.replace(/\/+$/, '');
+  const res = await fetch(`${base}/api/chat`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', ...(backend.apiKey ? { authorization: `Bearer ${backend.apiKey}` } : {}) },
+    body: JSON.stringify({
+      model,
+      messages: [{ role: 'user', content: 'hi' }],
+      stream: false,
+      think: false,
+      options: { num_predict: 1, ...(numCtx ? { num_ctx: numCtx } : {}) },
+    }),
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  await res.json();
+  const loaded = await loadedContexts(base);
+  const hit = loaded.find((m) => m.name === model || m.name?.startsWith(model));
+  return hit?.contextLength ?? null;
 }
 
 /** Choose whether Blaude stays in the request path for every session. */
@@ -673,6 +759,9 @@ export async function cmdCalibrate(argv) {
     out(`  ${C.yellow('!')} could not read /usage (${err.message})`);
   }
 
+  // Hoisted: this reads every transcript on disk with no mtime filter, and it was
+  // doing so once per window.
+  let limitHits = null;
   const suggestions = {};
   const notes = [];
   for (const [name, limit] of Object.entries(policy.limits)) {
@@ -692,7 +781,8 @@ export async function cmdCalibrate(argv) {
     if (!amount) {
       // Next best: moments you actually got a 429. At that instant you were at
       // the ceiling, so the preceding window's spend IS the allotment.
-      const hits = await findLimitEvents({});
+      if (!limitHits) limitHits = await findLimitEvents({});
+      const hits = limitHits;
       const kind = name === 'session' ? 'session' : 'weekly';
       const incidents = groupLimitIncidents(hits).filter((i) => i.kind === kind);
       const anchored = incidents.length ? allotmentFromIncidents(events, incidents, span, policy.weights) : null;
@@ -780,6 +870,7 @@ export async function cmdMode(argv) {
     out('');
     out(`  ${C.dim('blaude mode claude-first --floor 20%      use Claude until 20% of allowance remains')}`);
     out(`  ${C.dim('blaude mode claude-first --floor main=35,audit=5  per-purpose floors')}`);
+    out(`  ${C.dim('blaude mode claude-first --floor audit=never      never spend Claude on that purpose')}`);
     out('');
     return;
   }
@@ -790,12 +881,14 @@ export async function cmdMode(argv) {
     floors = {};
     const spec = String(flags.floor);
     if (spec.includes('=')) {
+      // Parsed here rather than stripped, so the config file records a settled
+      // fraction and `--floor audit=1%` cannot be flattened into the sentinel.
       for (const pair of spec.split(',')) {
         const [k, v] = pair.split('=');
-        floors[k.trim()] = Number(String(v).replace('%', ''));
+        floors[k.trim()] = parseFloor(v);
       }
     } else {
-      const v = Number(spec.replace('%', ''));
+      const v = parseFloor(spec);
       for (const p of ['main', 'tools']) floors[p] = v;
     }
   }
@@ -1056,7 +1149,7 @@ export async function cmdSimulate(argv) {
     candidates.push([`${flags.mode}${flags.floor ? ` @ ${flags.floor}` : ''}`, buildPolicy(cfg, flags.mode, flags.floor)]);
   } else {
     candidates.push(['local-only', buildPolicy(cfg, 'local-only')]);
-    candidates.push(['local-first', buildPolicy(cfg, 'local-first')]);
+    candidates.push(['claude-audits', buildPolicy(cfg, 'claude-audits')]);
     candidates.push(['claude-first @ 20%', buildPolicy(cfg, 'claude-first', '20')]);
     candidates.push(['claude-first @ 10%', buildPolicy(cfg, 'claude-first', '10')]);
     candidates.push(['claude-first @ 0%', buildPolicy(cfg, 'claude-first', '0')]);
@@ -1087,7 +1180,7 @@ export async function cmdSimulate(argv) {
 function buildPolicy(cfg, mode, floor) {
   const patch = { ...(cfg.policy || {}), mode };
   if (floor != null) {
-    const v = Number(String(floor).replace('%', ''));
+    const v = parseFloor(floor);
     patch.floors = { ...(cfg.policy?.floors || {}), main: v, tools: v };
   } else {
     delete patch.floors; // use the mode's own floors
@@ -1476,7 +1569,22 @@ export async function cmdSearch(argv) {
   if (!query) throw new Error('usage: blaude search "what you want to know"');
 
   const model = flags.model || policy.cloudModels.tools || 'haiku';
-  await assertAllowance('tools', { force: Boolean(flags.force), label: 'A web search' });
+
+  // A search is a capability gap, not ordinary work: `blaude search` exists only
+  // because WebSearch is withheld from local models, and it is a coarse one-shot
+  // over the transport that measured fine. Gating it on the `tools` floor pinned
+  // it to NEVER in every mode but claude-first, so the feature that fills the
+  // hole was itself switched off by default. It gets capability routing's own
+  // bounded floor instead — and local-only still means local-only.
+  const searchFloor = policy.mode === 'local-only'
+    ? NEVER
+    : (policy.capabilityRouting?.floor ?? 0.05);
+  await assertAllowance('tools', {
+    force: Boolean(flags.force),
+    label: 'A web search',
+    floor: searchFloor,
+    remedy: `lower policy.capabilityRouting.floor in ${CONFIG_FILE()}`,
+  });
   const t0 = Date.now();
   const result = await runClaudeCLI({
     prompt:
@@ -1650,9 +1758,11 @@ export async function cmdInit(argv) {
     models: DEFAULTS.models,
     defaultModel: DEFAULTS.defaultModel,
     policy: {
-      mode: 'local-first',
+      mode: 'claude-audits',
       limits: { session: { period: '5h', amount: 0 }, weekly: { period: 'week', amount: 0 } },
-      floors: { main: 1, tools: 1, audit: 0.05, background: 1 },
+      // "never" rather than 1: both mean the same thing, but only one of them
+      // reads correctly next to "audit": "5%".
+      floors: { main: 'never', tools: 'never', audit: '5%', background: 'never' },
       cloudTransport: 'cli',
       cloudModels: { main: 'sonnet', tools: 'haiku', audit: 'opus', background: 'haiku' },
     },

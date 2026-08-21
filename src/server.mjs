@@ -116,15 +116,18 @@ export function createGateway(cfg) {
   }
 
   // Watching the file means `blaude mode` / `blaude use` apply to a live session.
-  let watcher = null;
-  if (cfg.configSource && cfg.configSource !== '(defaults)') {
+  // Every layer, not just the most specific one: a home config and a project
+  // config both feed the running policy, so a change to either has to be seen.
+  const watchers = [];
+  let debounce = null;
+  for (const path of cfg.configSources || []) {
     try {
-      let debounce = null;
-      watcher = watch(cfg.configSource, () => {
+      const w = watch(path, () => {
         clearTimeout(debounce);
         debounce = setTimeout(() => reloadConfig('file changed'), 150);
       });
-      watcher.unref?.();
+      w.unref?.();
+      watchers.push(w);
     } catch { /* watching is a convenience, not a requirement */ }
   }
 
@@ -207,7 +210,7 @@ export function createGateway(cfg) {
 
   server.keepAliveTimeout = 120_000;
   server.blaude = { state, counters, cfg, reloadConfig };
-  server.on('close', () => watcher?.close?.());
+  server.on('close', () => { for (const w of watchers) w.close?.(); });
   server.headersTimeout = 130_000;
   server.requestTimeout = 0; // long local generations must not be cut off
   return { server, log, counters };
@@ -248,7 +251,7 @@ async function handleMessages({ cfg, log, counters, policy, meter, affinity, req
     counters.cloud++;
     if (policy.cloudTransport === 'cli') {
       counters.escalated++;
-      return escalateThroughCLI({ cfg, log, policy, meter, req, res, body, decision, t0 });
+      return escalateThroughCLI({ cfg, log, counters, policy, meter, req, res, body, decision, t0 });
     }
     const cloudRoute = resolveModel(cfg, `cloud/${decision.model}`);
     return passthroughToAnthropic({ cfg, log, req, res, body, raw, route: cloudRoute, t0, decision, meter });
@@ -413,22 +416,28 @@ async function relayStream({ cfg, log, counters, req, res, body, route, upstream
   const write = (event) => { if (!res.writableEnded) res.write(serializeSSE(event)); };
 
   let firstTokenMs = null;
+  const emit = (payloads) => {
+    const events = [];
+    for (const payload of payloads) {
+      if (payload === '[DONE]') continue;
+      if (payload.error) throw new Error(payload.error.message || JSON.stringify(payload.error));
+      // Ollama's native stream is NDJSON in its own shape; normalise it.
+      const normalised = isOllama ? fromOllamaChunk(payload, ollamaCursor) : [payload];
+      for (const p of normalised) events.push(...builder.pushChunk(p));
+    }
+    for (const e of events) {
+      if (firstTokenMs === null && e.event === 'content_block_delta') firstTokenMs = performance.now() - t0;
+      write(e);
+    }
+  };
+
   try {
     const decoder = new TextDecoder();
-    for await (const chunk of upstream.body) {
-      const events = [];
-      for (const payload of parser.push(decoder.decode(chunk, { stream: true }))) {
-        if (payload === '[DONE]') continue;
-        if (payload.error) throw new Error(payload.error.message || JSON.stringify(payload.error));
-        // Ollama's native stream is NDJSON in its own shape; normalise it.
-        const normalised = isOllama ? fromOllamaChunk(payload, ollamaCursor) : [payload];
-        for (const p of normalised) events.push(...builder.pushChunk(p));
-      }
-      for (const e of events) {
-        if (firstTokenMs === null && e.event === 'content_block_delta') firstTokenMs = performance.now() - t0;
-        write(e);
-      }
-    }
+    for await (const chunk of upstream.body) emit(parser.push(decoder.decode(chunk, { stream: true })));
+    // A last line without its terminator still carries the stop reason and the
+    // usage totals, and neither parser surfaces it until asked.
+    emit(parser.push(decoder.decode()));
+    emit(parser.flush());
     for (const e of builder.finish()) write(e);
     res.end();
   } catch (err) {
@@ -464,7 +473,8 @@ async function relayStream({ cfg, log, counters, req, res, body, route, upstream
 async function passthroughToAnthropic({ cfg, log, req, res, raw, route, t0, body, decision = null, meter = null }) {
   const url = `${route.backend.baseUrl.replace(/\/+$/, '')}/v1/messages`;
   const controller = new AbortController();
-  req.on('close', () => controller.abort());
+  const onClose = () => controller.abort();
+  req.on('close', onClose);
 
   // The requested model may have carried a `cloud/` prefix; send the real id.
   let forwardBody = raw;
@@ -472,36 +482,40 @@ async function passthroughToAnthropic({ cfg, log, req, res, raw, route, t0, body
 
   log.info(`\x1b[35mcloud\x1b[0m ${route.model} (${route.via}) — this request is billed`);
 
-  const upstream = await fetch(url, {
-    method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      'x-api-key': route.backend.apiKey,
-      'anthropic-version': req.headers['anthropic-version'] || '2023-06-01',
-      ...(req.headers['anthropic-beta'] ? { 'anthropic-beta': req.headers['anthropic-beta'] } : {}),
-    },
-    body: forwardBody,
-    signal: controller.signal,
-  });
+  try {
+    const upstream = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-api-key': route.backend.apiKey,
+        'anthropic-version': req.headers['anthropic-version'] || '2023-06-01',
+        ...(req.headers['anthropic-beta'] ? { 'anthropic-beta': req.headers['anthropic-beta'] } : {}),
+      },
+      body: forwardBody,
+      signal: controller.signal,
+    });
 
-  res.writeHead(upstream.status, {
-    'content-type': upstream.headers.get('content-type') || 'application/json',
-    'x-blaude-route': `anthropic/${route.model}`,
-  });
-  if (upstream.body) {
-    for await (const chunk of upstream.body) if (!res.writableEnded) res.write(chunk);
+    res.writeHead(upstream.status, {
+      'content-type': upstream.headers.get('content-type') || 'application/json',
+      'x-blaude-route': `anthropic/${route.model}`,
+    });
+    if (upstream.body) {
+      for await (const chunk of upstream.body) if (!res.writableEnded) res.write(chunk);
+    }
+    res.end();
+    const entry = usageEntry({ route, body, decision, ms: performance.now() - t0, cloud: true });
+    recordUsage(cfg, entry);
+    meter?.record(entry);
+  } finally {
+    req.off('close', onClose);
   }
-  res.end();
-  const entry = usageEntry({ route, body, decision, ms: performance.now() - t0, cloud: true });
-  recordUsage(cfg, entry);
-  meter?.record(entry);
 }
 
 /**
  * Cloud escalation over the official CLI — your subscription, not API credits.
  * The CLI answers in one piece, so a streaming caller gets a synthesized stream.
  */
-async function escalateThroughCLI({ cfg, log, policy, meter, req, res, body, decision, t0 }) {
+async function escalateThroughCLI({ cfg, log, counters, policy, meter, req, res, body, decision, t0 }) {
   const model = decision.model || 'sonnet';
   log.info(
     `\x1b[35mclaude\x1b[0m ${model} via CLI · purpose=${decision.purpose} · ${decision.reason}`,
@@ -525,7 +539,10 @@ async function escalateThroughCLI({ cfg, log, policy, meter, req, res, body, dec
     if (policy.onExhausted === 'error') {
       return sendError(res, 502, 'api_error', `Claude escalation failed: ${err.message}`);
     }
-    // Falling back locally beats failing the request outright.
+    // Falling back locally beats failing the request outright. The counters said
+    // Claude served it, which is exactly what did not happen.
+    counters.cloud--;
+    counters.escalated--;
     log.warn('falling back to the local model for this request');
     const route = resolveModel(cfg, stripPurposePrefix(body.model));
     const openaiReq = anthropicToOpenAI(body, route, cfg);
@@ -566,18 +583,34 @@ async function escalateThroughCLI({ cfg, log, policy, meter, req, res, body, dec
   return res.end();
 }
 
-/** Used when an escalation fails and we would rather answer than error. */
+/**
+ * Used when an escalation fails and we would rather answer than error.
+ *
+ * This has to speak the backend's own dialect like every other local path does.
+ * It was posting to `/chat/completions` unconditionally, which is not a route
+ * Ollama serves — so on the default backend the safety net answered "local
+ * fallback returned 404" every time it was needed.
+ */
 async function serveLocalFallback({ cfg, log, req, res, body, route, openaiReq, t0, decision }) {
-  const upstream = await fetch(`${route.backend.baseUrl.replace(/\/+$/, '')}/chat/completions`, {
+  const isOllama = route.backend.kind === 'ollama';
+  const base = route.backend.baseUrl.replace(/\/+$/, '');
+  const payload = { ...openaiReq, stream: false };
+
+  const upstream = await fetch(isOllama ? `${base}/api/chat` : `${base}/chat/completions`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', ...(route.backend.apiKey ? { authorization: `Bearer ${route.backend.apiKey}` } : {}) },
-    body: JSON.stringify({ ...openaiReq, stream: false }),
+    body: JSON.stringify(isOllama
+      ? toOllamaRequest(payload, { numCtx: route.maxContext || null, think: cfg.thinking === 'text' })
+      : payload),
   }).catch((e) => { throw new TranslateError(`local fallback failed too: ${e.message}`, { status: 502 }); });
 
   if (!upstream.ok) {
-    return sendError(res, 502, 'api_error', `local fallback returned ${upstream.status}`);
+    const detail = (await upstream.text().catch(() => '')).slice(0, 300);
+    log.error(`local fallback returned ${upstream.status}: ${detail}`);
+    return sendError(res, 502, 'api_error', `local fallback returned ${upstream.status}: ${detail}`);
   }
-  const completion = await upstream.json();
+  const rawCompletion = await upstream.json();
+  const completion = isOllama ? fromOllamaResponse(rawCompletion) : rawCompletion;
   const msg = openAIToAnthropic(completion, {
     requestedModel: body.model, thinking: cfg.thinking, textToolCalls: cfg.textToolCalls,
     inputTokenEstimate: estimateRequestTokens(body),

@@ -44,7 +44,7 @@ export async function loadedContexts(baseUrl = 'http://127.0.0.1:11434') {
 
 /**
  * Plan (and optionally perform) raising the cap.
- * @returns {{steps:Array<{描述?:string, description:string, command:string}>, flavour:string|null}}
+ * @returns {{steps:Array<{description:string, command:string, argv:Array}>, flavour:string|null, value:number}}
  */
 export function planContextChange(tokens, detected = detectOllama(), { kvType = null } = {}) {
   const value = String(Math.max(2048, Math.floor(tokens)));

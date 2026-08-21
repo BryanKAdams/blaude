@@ -1,10 +1,12 @@
 // Ollama's native /api/chat, adapted to look like OpenAI chat.completions.
 //
 // Why bother when Ollama already speaks OpenAI: only the native endpoint accepts
-// `options.num_ctx`, which overrides the daemon's context cap PER REQUEST. That
-// cap defaults low and truncates silently, so being able to set it per request is
-// the difference between a working coding agent and a lobotomised one — with no
-// daemon restart and no global config change.
+// `options.num_ctx`, which is how you ask for a context larger than the daemon's
+// own default. Measured both ways: with OLLAMA_CONTEXT_LENGTH unset, num_ctx is
+// honoured up to what memory allows (262,144 asked for, 262,144 reported by
+// /api/ps); with the variable SET, it is a ceiling num_ctx cannot exceed. Either
+// way the server truncates the overflow in silence rather than erroring, so
+// asking for the right number matters more than it should.
 //
 // Everything here converts to/from the OpenAI shape so the rest of Blaude's
 // translation pipeline stays unchanged.
@@ -15,6 +17,17 @@ const toolCallId = () => `call_${randomBytes(8).toString('hex')}`;
 
 /** OpenAI-shaped request -> Ollama /api/chat body. */
 export function toOllamaRequest(openaiReq, { numCtx = null, think = false } = {}) {
+  // Ollama labels a tool result with the tool's NAME. An OpenAI-shaped `tool`
+  // message carries only the call id, so recover the name from the assistant turn
+  // that made the call — sending the id put `toolu_01ABC…` where the model
+  // expected `Read`, leaving it unable to tell which result came from what.
+  const toolNameById = new Map();
+  for (const m of openaiReq.messages || []) {
+    for (const tc of m.tool_calls || []) {
+      if (tc.id && tc.function?.name) toolNameById.set(tc.id, tc.function.name);
+    }
+  }
+
   const messages = (openaiReq.messages || []).map((m) => {
     // Ollama takes images as a sibling array of bare base64 strings.
     if (Array.isArray(m.content)) {
@@ -43,7 +56,10 @@ export function toOllamaRequest(openaiReq, { numCtx = null, think = false } = {}
     }
     if (m.role === 'tool') {
       out.role = 'tool';
-      if (m.tool_call_id) out.tool_name = m.tool_call_id;
+      // No name recovered means the tool_use never came through us; omitting the
+      // field beats labelling the result with something that is not a tool name.
+      const name = toolNameById.get(m.tool_call_id);
+      if (name) out.tool_name = name;
     }
     return out;
   });
