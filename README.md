@@ -287,6 +287,46 @@ Everything that depends on undocumented Claude Code internals is confined to
 `usage-command.mjs`, `claude-usage.mjs`, and `claude-cli.mjs` — if a format
 changes, that is where to look.
 
+## Measured: is "local works, Claude checks" cheaper than just using Claude?
+
+Yes for one audit at the end; emphatically no for a review every turn. Same task
+(count the TODOs under src/, ground truth 7 and `api.py`), same local pass shared
+across arms so the only variable is the Claude layer on top. Local model
+Qwen3-27B at a 32k context; auditor and baseline both Sonnet.
+
+| arm | Claude tokens | requests | wall | correct |
+|---|---|---|---|---|
+| Claude direct | 24.2k | 3 | 8.1s | yes |
+| local only | **0** | 0 | 797s | yes |
+| local + **one** audit | **18.9k** (78%) | 3 | 492s | yes |
+| local + **per-turn** review | 68.7k (364%) | 17 | 870s | yes |
+
+- **One audit beats using Claude, by 22%.** Claude never opens the files: it gets
+  a compact brief and verifies. The audit call itself took 15.7s.
+- **Per-turn review costs 3.6x Claude direct, and it is self-defeating.** The
+  reviewer solved the task itself on turn 2 from the local model's tool output,
+  then re-asserted that same answer thirteen more times while the local model
+  ground on. Give a reviewer enough context to judge the work and you have given
+  it enough to do the work. This is why per-turn review is not a feature.
+- **The audit changed nothing here**, because the local answer was already
+  correct. So there is still no measurement of an audit catching a real error —
+  the one time the local model failed, the cause was a context-thrash bug, and
+  the reviewer did diagnose that correctly every turn.
+
+Local models, same task, both correct with zero Claude tokens:
+
+| model | wall | turns | per turn once warm |
+|---|---|---|---|
+| Qwen3-27B | 608s | 9 | **16-27s** |
+| Qwen3-8B | 541s | 8 | 70-76s |
+
+The 27B's steady-state turns are roughly 3x faster than the 8B's despite being
+three times the size — its logs credit speculative decoding
+(`--spec-type draft-mtp`) and prefix-cache checkpoints the 8B run did not get.
+There is no speed argument for the smaller model on this machine.
+
+Single task, easy task. Both models succeeding says nothing about harder work.
+
 ## Measured: three ways to do the same task
 
 One task ("count the TODOs under src/ and say which file has the most", ground
