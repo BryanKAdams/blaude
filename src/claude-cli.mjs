@@ -13,6 +13,7 @@
 //            outer agent loop.
 
 import { spawn } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { writeFileSync, existsSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { BLAUDE_HOME } from './config.mjs';
@@ -53,6 +54,56 @@ Rules:
 - Put any explanation BEFORE the tool call block.
 - If no tool is needed, just answer normally.
 `.trim();
+
+/**
+ * Persistent relay sessions, keyed per conversation.
+ *
+ * Without this, every escalation spawns a fresh `claude -p`, which means (a) the
+ * child re-primes its whole system prompt, and (b) Blaude re-renders the entire
+ * conversation as text so the child has context. Both grow with the
+ * conversation, which is why per-turn relay measured at ~2x a native session.
+ *
+ * With a session id we keep one child conversation alive and send only what is
+ * new since the last escalation — the way you would paste an update into a
+ * second window rather than retyping the whole thread.
+ */
+const relaySessions = new Map(); // key -> {sessionId, sentMessages, at, turns}
+const RELAY_TTL_MS = 2 * 3600_000;
+
+export function relaySessionState(key) {
+  if (!key) return null;
+  const state = relaySessions.get(key);
+  if (!state) return null;
+  if (Date.now() - state.at > RELAY_TTL_MS) { relaySessions.delete(key); return null; }
+  return state;
+}
+
+export function resetRelaySessions() { relaySessions.clear(); }
+
+/** Only the messages the child has not seen yet. */
+function renderDelta(body, fromIndex, { includeTools }) {
+  const fresh = (body.messages || []).slice(fromIndex);
+  const lines = ['=== NEW SINCE YOUR LAST TURN ==='];
+  for (const msg of fresh) {
+    const blocks = typeof msg.content === 'string' ? [{ type: 'text', text: msg.content }] : (msg.content || []);
+    for (const b of blocks) {
+      if (!b) continue;
+      if (b.type === 'text' && b.text) lines.push(`[${msg.role}] ${b.text}`);
+      else if (b.type === 'tool_use') lines.push(`[you asked to call ${b.name}] ${JSON.stringify(b.input)}`);
+      else if (b.type === 'tool_result') {
+        const text = typeof b.content === 'string'
+          ? b.content
+          : (b.content || []).map((c) => c?.text ?? '').join('\n');
+        lines.push(`[result of that call${b.is_error ? ' — ERROR' : ''}] ${truncate(text, 4000)}`);
+      }
+    }
+  }
+  lines.push('');
+  lines.push(includeTools
+    ? 'Continue. Emit another <tool_call> block if you need one, otherwise answer.'
+    : 'Continue.');
+  return lines.join('\n');
+}
 
 function renderConversation(body, { includeTools }) {
   const lines = [];
@@ -203,12 +254,49 @@ export async function escalateViaCLI(body, {
   bin,
   env,
   lean = true,
+  sessionKey = null,
 } = {}) {
   const includeTools = shape === 'relay' && Array.isArray(body.tools) && body.tools.length > 0;
-  const prompt = renderConversation(body, { includeTools });
   const appendSystemPrompt = includeTools ? TOOL_CONTRACT : null;
+  const messageCount = (body.messages || []).length;
 
-  const result = await runClaudeCLI({ prompt, model, appendSystemPrompt, cwd, timeoutMs, bin, env, lean });
+  // Continue an existing child conversation when we have one, sending only the
+  // delta. Falls back to a full render if resuming fails.
+  const existing = sessionKey ? relaySessionState(sessionKey) : null;
+  let result = null;
+  let reused = false;
+
+  if (existing && existing.sentMessages < messageCount) {
+    try {
+      result = await runClaudeCLI({
+        prompt: renderDelta(body, existing.sentMessages, { includeTools }),
+        model, appendSystemPrompt, cwd, timeoutMs, bin, env, lean,
+        extraArgs: ['--resume', existing.sessionId],
+      });
+      reused = true;
+    } catch (err) {
+      // A stale or unresumable session should not fail the request.
+      relaySessions.delete(sessionKey);
+      result = null;
+    }
+  }
+
+  if (!result) {
+    const sessionId = randomUUID();
+    result = await runClaudeCLI({
+      prompt: renderConversation(body, { includeTools }),
+      model, appendSystemPrompt, cwd, timeoutMs, bin, env, lean,
+      extraArgs: sessionKey ? ['--session-id', sessionId] : [],
+    });
+    if (sessionKey) relaySessions.set(sessionKey, { sessionId, sentMessages: messageCount, at: Date.now(), turns: 1 });
+  } else {
+    const state = relaySessions.get(sessionKey);
+    if (state) {
+      state.sentMessages = messageCount;
+      state.at = Date.now();
+      state.turns += 1;
+    }
+  }
 
   // Claude's <tool_call> blocks become real tool_use content for the caller.
   const scanned = scanText(result.text, { thinking: 'strip', textToolCalls: includeTools });
@@ -221,6 +309,8 @@ export async function escalateViaCLI(body, {
 
   const u = result.usage || {};
   return {
+    reusedSession: reused,
+    relayTurns: sessionKey ? relaySessions.get(sessionKey)?.turns ?? 1 : null,
     message: {
       id: `msg_blaude_cli_${(result.sessionId || '').slice(0, 12) || Math.random().toString(16).slice(2, 14)}`,
       type: 'message',

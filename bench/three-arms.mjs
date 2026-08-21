@@ -107,6 +107,21 @@ async function armB() {
   return { name: 'B blaude-relay', ms: t1 - t0, text: j.result || r.out, turns: j.num_turns ?? null, spend: await claudeSpend(t0, t1, known) };
 }
 
+/**
+ * The mode you would actually run in claude-audits: no Claude at all.
+ *
+ * The interesting columns here are correctness and wall clock — Claude spend is
+ * zero by construction, which is the whole point.
+ */
+async function armD() {
+  const known = await sessionsBefore(Date.now() - 7 * 86_400_000);
+  const t0 = Date.now();
+  const r = await run('node', [BLAUDE, '--local', '-p', '--output-format', 'json', '--allowedTools', 'Read,Glob'], { input: TASK });
+  const t1 = Date.now();
+  const j = result(r);
+  return { name: 'D local-only', ms: t1 - t0, text: j.result || r.out, turns: j.num_turns ?? null, spend: await claudeSpend(t0, t1, known) };
+}
+
 async function armC() {
   const known = await sessionsBefore(Date.now() - 7 * 86_400_000);
   const t0 = Date.now();
@@ -127,11 +142,16 @@ async function armC() {
   };
 }
 
+const C_DIM = '\x1b[90m';
+const C_OFF = '\x1b[0m';
 const fmt = (n) => (n >= 1e6 ? `${(n / 1e6).toFixed(2)}M` : n >= 1e3 ? `${(n / 1e3).toFixed(1)}k` : String(n));
 
 setup();
+const WANT = (process.env.BENCH_ARMS || 'ABC').toUpperCase();
+const chosen = [['A', armA], ['B', armB], ['C', armC], ['D', armD]]
+  .filter(([k]) => WANT.includes(k)).map(([, fn]) => fn);
 const arms = [];
-for (const fn of [armA, armB, armC]) {
+for (const fn of chosen) {
   const a = await fn();
   a.grade = grade(a.text);
   arms.push(a);
@@ -158,6 +178,13 @@ console.log('  what each arm actually replied:');
 for (const a of arms) {
   const oneLine = String(a.text || '').replace(/\s+/g, ' ').trim().slice(0, 150);
   console.log(`    ${a.name}: ${oneLine || '(empty)'}`);
+  if (a.localText) {
+    const lg = grade(a.localText);
+    const before = String(a.localText).replace(/\s+/g, ' ').trim().slice(0, 110);
+    console.log(`      local model alone: ${lg.totalOk && lg.mostOk ? 'CORRECT' : `total ${lg.total} / most ${lg.most}`}  ${C_DIM}${before}${C_OFF}`);
+    console.log(`      after the audit  : ${a.grade.totalOk && a.grade.mostOk ? 'CORRECT' : `total ${a.grade.total} / most ${a.grade.most}`}`);
+    console.log(`      audit ${lg.totalOk === a.grade.totalOk && lg.mostOk === a.grade.mostOk ? 'left the answer unchanged' : 'CHANGED the answer'}`);
+  }
 }
 
 const base = arms[0].spend.weighted || 1;

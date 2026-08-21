@@ -68,6 +68,17 @@ export const DEFAULTS = {
   // the most out of Claude while you have allowance.
   launch: 'auto',
 
+  // What to strip from a Claude Code session that a local model will serve.
+  //
+  // MCP servers are the big one: their tool definitions are sent on every
+  // request, and a local model pays for them in prompt-evaluation time it can
+  // barely use. Measured here: a trivial task in an empty directory produced a
+  // 52k-token prompt with 46 tool definitions, at 154s to first token. A local
+  // model wants a small prompt far more than it wants a browser.
+  //
+  // Set `disableMcp: false` if you need MCP tools in local sessions.
+  localSession: { disableMcp: true, disableBundledSkills: false },
+
   // Tools that do not function when a local model is driving.
   //
   // WebSearch is the proven case: it is a client-side tool, so a local model CAN

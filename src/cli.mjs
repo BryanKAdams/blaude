@@ -119,6 +119,21 @@ function bar(fraction, width = 24) {
 }
 
 /**
+ * Extra CLI arguments for a local session, trimming what the local model cannot
+ * use but would otherwise pay for on every single request.
+ */
+export function localSessionArgs(cfg) {
+  const args = [];
+  if (cfg.localSession?.disableMcp !== false) {
+    args.push('--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}');
+  }
+  if (cfg.localSession?.disableBundledSkills) {
+    args.push('--settings', JSON.stringify({ disableBundledSkills: true }));
+  }
+  return args;
+}
+
+/**
  * Environment for a Claude Code session served by the gateway.
  *
  * Deliberately sets NO credential. Claude Code does not need one when
@@ -254,6 +269,7 @@ export async function cmdLaunch(argv) {
   } else {
     await ensureGateway(cfg);
     Object.assign(env, localSessionEnv(cfg));
+    args.unshift(...localSessionArgs(cfg));
   }
 
   const bin = process.env.BLAUDE_CLAUDE_BIN || 'claude';
@@ -1015,8 +1031,9 @@ export async function cmdResume(argv) {
 
   await ensureGateway(cfg);
   const env = { ...process.env, ...localSessionEnv(cfg) };
+  const localArgs = localSessionArgs(cfg);
   const prompt = `${briefing}\n---\nAcknowledge in one sentence what state the work is in, then continue.`;
-  const child = spawn(process.env.BLAUDE_CLAUDE_BIN || 'claude', [prompt], { stdio: 'inherit', env, cwd });
+  const child = spawn(process.env.BLAUDE_CLAUDE_BIN || 'claude', [...localArgs, prompt], { stdio: 'inherit', env, cwd });
   child.on('exit', (code) => process.exit(code ?? 0));
 }
 

@@ -2,6 +2,7 @@
 import { createServer } from 'node:http';
 import { watch } from 'node:fs';
 import { performance } from 'node:perf_hooks';
+import { loadConfig } from './config.mjs';
 import { resolveModel, RouteError } from './router.mjs';
 import { anthropicToOpenAI, flattenSystem, TranslateError } from './anthropic-to-openai.mjs';
 import { openAIToAnthropic, estimateTokens, newMessageId } from './openai-to-anthropic.mjs';
@@ -495,6 +496,9 @@ async function escalateThroughCLI({ cfg, log, policy, meter, req, res, body, dec
       shape: Array.isArray(body.tools) && body.tools.length ? 'relay' : 'oracle',
       cwd: cfg.escalationCwd || process.cwd(),
       timeoutMs: cfg.escalationTimeoutMs || 300_000,
+      // One child conversation per outer conversation, so a relayed turn sends
+      // only what is new instead of the whole thread.
+      sessionKey: policy.experimentalRelay === false ? null : TurnAffinity.fingerprint(body),
     });
   } catch (err) {
     log.error(`escalation to Claude failed: ${err.message}`);
@@ -524,7 +528,10 @@ async function escalateThroughCLI({ cfg, log, policy, meter, req, res, body, dec
   meter?.record(entry);
   log.info(
     `\x1b[35mclaude\x1b[0m ${model} ${msg.usage.input_tokens} in / ${msg.usage.output_tokens} out · ` +
-    `${(ms / 1000).toFixed(1)}s${result.costUsd != null ? ` · CLI reports $${result.costUsd.toFixed(4)}` : ''}`,
+    `cache ${msg.usage.cache_creation_input_tokens} new / ${msg.usage.cache_read_input_tokens} read · ` +
+    `${(ms / 1000).toFixed(1)}s` +
+    `${result.reusedSession ? ` · resumed relay session (turn ${result.relayTurns})` : ' · new relay session'}` +
+    `${result.costUsd != null ? ` · CLI reports $${result.costUsd.toFixed(4)}` : ''}`,
   );
 
   if (!body.stream) return sendJSON(res, 200, msg);
