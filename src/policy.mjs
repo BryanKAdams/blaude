@@ -121,6 +121,18 @@ export const DEFAULT_POLICY = {
   //   api -> api.anthropic.com with ANTHROPIC_API_KEY, i.e. metered billing
   cloudTransport: 'cli',
 
+  // Relaying an ORDINARY agent turn through `claude -p` is off by default,
+  // because it measured badly on both axes:
+  //   * ~2x the Claude tokens and ~4x the wall clock of a native session, since
+  //     the outer conversation cannot reuse the prompt cache
+  //   * and it did not reliably finish the task — a benchmark turn came back
+  //     empty, where the same task succeeded natively
+  //
+  // Coarse one-shots over the same transport (audits, `blaude search`) work
+  // fine, so those are unaffected. For Claude to do ordinary work, run it
+  // natively: `blaude route auto` plus `blaude guard on`.
+  experimentalRelay: false,
+
   cloudModels: { main: 'sonnet', tools: 'haiku', audit: 'opus', background: 'haiku' },
   localModels: { main: null, tools: null, audit: null, background: 'blaude-small' },
 };
@@ -528,6 +540,20 @@ export function decide({ policy, meter, body, requestedModel, explicit = null, l
       ...localFallback,
       exhausted: true,
       reason: `${pct(tight.fractionRemaining)} of ${tight.name} allowance left, under the ${pct(floor)} floor for ${purpose} — staying local`,
+    };
+  }
+
+  // The relay is measurably worse than a native session for ordinary turns, so
+  // it is not used for them unless explicitly enabled.
+  const isOrdinaryTurn = purpose === 'main' || purpose === 'tools';
+  if (isOrdinaryTurn && policy.cloudTransport === 'cli' && !policy.experimentalRelay) {
+    return {
+      ...localFallback,
+      relayDeclined: true,
+      reason:
+        `${pct(tight.fractionRemaining)} of ${tight.name} allowance left, but relaying an ordinary ` +
+        `turn through the CLI costs ~2x a native session and is unreliable — staying local. ` +
+        `Use \`blaude route auto\` for Claude to do the work, or set policy.experimentalRelay.`,
     };
   }
 

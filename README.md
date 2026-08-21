@@ -287,6 +287,40 @@ Everything that depends on undocumented Claude Code internals is confined to
 `usage-command.mjs`, `claude-usage.mjs`, and `claude-cli.mjs` — if a format
 changes, that is where to look.
 
+## Measured: three ways to do the same task
+
+One task ("count the TODOs under src/ and say which file has the most", ground
+truth 7 and `api.py`), three routes. Claude spend attributed only to the sessions
+each arm created, weighted with cache reads at 0.1.
+
+| arm | Claude tokens | requests | wall | got it right? |
+|---|---|---|---|---|
+| **A** native Claude | **25.0k** | 3 | **9.7s** | no — said 6 |
+| **B** Blaude relays every turn to Claude | 48.7k (195%) | 5 | 41.5s | **no answer at all** |
+| **C** local model works, Claude audits once | 55.7k (223%) | 7 | 44.3s | **yes** |
+
+Three things follow, and two of them are unflattering:
+
+- **Relaying ordinary turns to Claude through Blaude is a bad trade** — roughly
+  double the tokens and quadruple the wall clock, because each turn spawns a
+  fresh `claude -p` and the outer conversation cannot reuse the prompt cache.
+  A rerun produced no answer at all. So it is off by default
+  (`policy.experimentalRelay`), and ordinary turns stay local with an explanation.
+  For Claude to do the work, run it natively: `blaude route auto` + `blaude guard on`.
+- **"Local does it, then Claude checks it" is not a token-efficiency play.** It
+  cost more than simply asking Claude, because the audit re-reasons about the
+  problem. Its value is quality, not savings.
+- **It was the only arm that got the right answer.** Native Claude miscounted;
+  the local pass plus an audit did not. A single sample proves nothing about
+  models, but it does show the second pass earning its cost.
+
+The honest efficiency story is narrower than "route everything through Blaude":
+local work is free, and Claude is worth spending on selectively — for audits when
+correctness matters, and for the turns you knowingly hand it.
+
+Coarse one-shots over the same CLI transport (`blaude audit`, `blaude search`)
+work reliably; it is only the per-turn relay that does not.
+
 ## Measured: local + Claude's search vs Claude alone
 
 One question, both paths, real runs. "What is the latest Kingdom Hearts IV news,

@@ -32,6 +32,14 @@ const C = {
 };
 
 const out = (...a) => console.log(...a);
+/**
+ * Human-facing chrome that must never pollute stdout.
+ *
+ * `blaude -p --output-format json` is a data pipeline: anything printed to
+ * stdout ends up in the caller's JSON. The launcher banner belongs on stderr,
+ * where a person still sees it and a script does not.
+ */
+const note = (...a) => console.error(...a);
 const CONFIG_FILE = () => join(BLAUDE_HOME, 'config.json');
 
 // ---------------------------------------------------------------------------
@@ -77,7 +85,7 @@ async function ensureGateway(cfg, { quiet = false } = {}) {
     await new Promise((r) => setTimeout(r, 250));
     const health = await gatewayHealth(cfg);
     if (health) {
-      if (!quiet) out(C.dim(`  gateway started (pid ${child.pid}, log ${logPath})`));
+      if (!quiet) note(C.dim(`  gateway started (pid ${child.pid}, log ${logPath})`));
       return { started: true, health };
     }
   }
@@ -217,23 +225,23 @@ export async function cmdLaunch(argv) {
     : liveDecision;
 
   const tight = meter.tightest();
-  out('');
-  out(`  ${C.bold('Blaude')} ${C.dim('· ' + policy.mode)}`);
-  out(`  allowance   ${tight ? `${bar(tight.fractionRemaining)} ${pct(tight.fractionRemaining)} of ${tight.name} left` : C.yellow('not calibrated — run `blaude calibrate`')}`);
+  note('');
+  note(`  ${C.bold('Blaude')} ${C.dim('· ' + policy.mode)}`);
+  note(`  allowance   ${tight ? `${bar(tight.fractionRemaining)} ${pct(tight.fractionRemaining)} of ${tight.name} left` : C.yellow('not calibrated — run `blaude calibrate`')}`);
   if (alwaysGateway) {
     const per = liveDecision.destination === 'cloud'
       ? C.magenta(`Claude ${liveDecision.model}`) + C.dim(' (escalated per request)')
       : C.green(`local ${cfg.defaultModel}`);
-    out(`  session     ${C.cyan('routed by Blaude')} ${C.dim('— every request is policy-checked')}`);
-    out(`  new turns   ${per}`);
-    out(`  ${C.dim(liveDecision.reason)}`);
+    note(`  session     ${C.cyan('routed by Blaude')} ${C.dim('— every request is policy-checked')}`);
+    note(`  new turns   ${per}`);
+    note(`  ${C.dim(liveDecision.reason)}`);
   } else {
-    out(`  session     ${decision.destination === 'cloud'
+    note(`  session     ${decision.destination === 'cloud'
       ? C.magenta('Claude ' + (decision.model || 'sonnet')) + C.dim(' (native, not routed)')
       : C.green('local ' + cfg.defaultModel)}`);
-    out(`  ${C.dim(decision.reason)}`);
+    note(`  ${C.dim(decision.reason)}`);
   }
-  out('');
+  note('');
 
   const env = { ...process.env };
   const args = [...positional];
@@ -417,8 +425,25 @@ export async function cmdRoute(argv) {
   const file = writeConfigPatch({ launch: choice });
   out(`${C.green('✓')} launch mode set to ${C.cyan(choice)}`);
   out(C.dim(`  ${file}`));
+
+  const policy = normalizePolicy(cfg.policy || {});
+  const sendsWorkToClaude = (policy.floors?.main ?? NEVER) < NEVER;
+
   if (choice === 'gateway') {
     out(C.dim('  Blaude now stays in the path for every session — the guard hook is optional.'));
+    if (sendsWorkToClaude) {
+      out('');
+      out(`  ${C.yellow('!')} Your mode (${policy.mode}) sends ordinary turns to Claude, and in this launch`);
+      out(`    mode every one of those is relayed through a fresh \`claude -p\`. Measured on a`);
+      out(`    small agent task: ${C.bold('~2x the Claude tokens and ~4x the wall clock')} of a native`);
+      out(`    session, because the outer conversation cannot reuse the prompt cache.`);
+      out(`    ${C.dim('Cheaper combinations:')}`);
+      out(`      ${C.cyan('blaude route auto')} + ${C.cyan('blaude guard on')}   ${C.dim('native Claude, hook enforces the floor')}`);
+      out(`      ${C.cyan('blaude mode claude-audits')}          ${C.dim('keep work local; then gateway costs nothing extra')}`);
+    } else {
+      out(C.dim(`  Your mode (${policy.mode}) keeps ordinary turns local, so staying in the path`));
+      out(C.dim('  costs nothing extra — the relay tax only applies to Claude-served turns.'));
+    }
   } else {
     out(C.dim('  Native Claude sessions are unprotected unless you run `blaude guard on`.'));
   }

@@ -62,14 +62,14 @@ test('claude-audits keeps work local and lets audits reach Claude', () => {
 });
 
 test('claude-first falls back exactly at the floor', () => {
-  const policy = normalizePolicy({ mode: 'claude-first', floors: { main: 20 } });
+  const policy = normalizePolicy({ mode: 'claude-first', floors: { main: 20 }, experimentalRelay: true });
   assert.equal(decide({ policy, meter: fakeMeter(0.21), body: freshTurn, requestedModel: 'm' }).destination, 'cloud');
   assert.equal(decide({ policy, meter: fakeMeter(0.20), body: freshTurn, requestedModel: 'm' }).destination, 'local');
   assert.equal(decide({ policy, meter: fakeMeter(0.19), body: freshTurn, requestedModel: 'm' }).destination, 'local');
 });
 
 test('reserved tails let audits continue after ordinary work has fallen back', () => {
-  const policy = normalizePolicy({ mode: 'claude-first', floors: { main: 20, tools: 10, audit: 5 } });
+  const policy = normalizePolicy({ mode: 'claude-first', floors: { main: 20, tools: 10, audit: 5 }, experimentalRelay: true });
   const meter = fakeMeter(0.08); // 8% left
   assert.equal(decide({ policy, meter, body: freshTurn, requestedModel: 'm' }).destination, 'local');
   assert.equal(decide({ policy, meter, body: loopTurn, requestedModel: 'm' }).destination, 'local');
@@ -78,7 +78,7 @@ test('reserved tails let audits continue after ordinary work has fallen back', (
 });
 
 test('a per-model window blocks only that model', () => {
-  const policy = normalizePolicy({ mode: 'claude-first', floors: { main: 10, audit: 5 } });
+  const policy = normalizePolicy({ mode: 'claude-first', floors: { main: 10, audit: 5 }, experimentalRelay: true });
   // Account-wide is healthy, but the Opus week is spent.
   const meter = fakeMeter(0.9, { perModel: { opus: 0.01 } });
   assert.equal(decide({ policy, meter, body: freshTurn, requestedModel: 'm' }).destination, 'cloud');
@@ -110,7 +110,7 @@ test('an uncalibrated meter never spends Claude by accident', () => {
 });
 
 test('a turn finishes where it started, and hands off on the next prompt', () => {
-  const policy = normalizePolicy({ mode: 'claude-first', floors: { main: 20, tools: 20 } });
+  const policy = normalizePolicy({ mode: 'claude-first', floors: { main: 20, tools: 20 }, experimentalRelay: true });
   const affinity = new TurnAffinity();
 
   // Turn starts with plenty of allowance.
@@ -131,7 +131,7 @@ test('a turn finishes where it started, and hands off on the next prompt', () =>
 });
 
 test('the hard stop breaks turn affinity to protect the remainder', () => {
-  const policy = normalizePolicy({ mode: 'claude-first', floors: { main: 20, tools: 20 } });
+  const policy = normalizePolicy({ mode: 'claude-first', floors: { main: 20, tools: 20 }, experimentalRelay: true });
   const affinity = new TurnAffinity();
   affinity.set(TurnAffinity.fingerprint(loopTurn), 'cloud', 'sonnet');
   const d = decide({ policy, meter: fakeMeter(0.01), body: loopTurn, requestedModel: 'm', affinity });
@@ -214,4 +214,25 @@ test('the old mode name still resolves, so existing configs keep working', () =>
   const legacy = normalizePolicy({ mode: 'local-first' });
   assert.equal(legacy.mode, 'claude-audits');
   assert.deepEqual(legacy.floors, normalizePolicy({ mode: 'claude-audits' }).floors);
+});
+
+test('an ordinary turn is not relayed through the CLI by default', () => {
+  // Measured: ~2x the tokens, ~4x the latency, and it did not finish the task.
+  const policy = normalizePolicy({ mode: 'claude-first', floors: { main: 0, tools: 0 } });
+  const d = decide({ policy, meter: fakeMeter(0.9), body: freshTurn, requestedModel: 'm' });
+  assert.equal(d.destination, 'local');
+  assert.ok(d.relayDeclined);
+  assert.match(d.reason, /route auto/);
+});
+
+test('audits still escalate over the same transport', () => {
+  const policy = normalizePolicy({ mode: 'claude-first' });
+  const d = decide({ policy, meter: fakeMeter(0.9), body: freshTurn, requestedModel: 'audit/opus' });
+  assert.equal(d.destination, 'cloud', 'a coarse one-shot audit is not affected');
+});
+
+test('the relay can be opted into explicitly', () => {
+  const policy = normalizePolicy({ mode: 'claude-first', floors: { main: 0 }, experimentalRelay: true });
+  const d = decide({ policy, meter: fakeMeter(0.9), body: freshTurn, requestedModel: 'm' });
+  assert.equal(d.destination, 'cloud');
 });
