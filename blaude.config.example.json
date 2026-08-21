@@ -1,0 +1,75 @@
+{
+  "//": "Copy to ~/.blaude/config.json (or ./blaude.config.json) and edit. Every field is optional; defaults live in src/config.mjs and src/policy.mjs.",
+
+  "host": "127.0.0.1",
+  "port": 8817,
+
+  "backends": {
+    "ollama": { "kind": "ollama", "baseUrl": "http://127.0.0.1:11434", "apiKey": null },
+    "mlx": { "kind": "openai", "baseUrl": "http://127.0.0.1:8081/v1", "apiKey": "mlx" },
+    "anthropic": { "kind": "anthropic", "baseUrl": "https://api.anthropic.com", "apiKeyEnv": "ANTHROPIC_API_KEY" }
+  },
+
+  "models": {
+    "blaude": { "backend": "ollama", "model": "qwen3:8b", "maxContext": 65536, "maxOutput": 8192 },
+    "blaude-small": { "backend": "ollama", "model": "qwen3:4b", "maxContext": 32768, "maxOutput": 4096 },
+
+    "//mlx-example": "Once you have an MLX server running, point the default at it:",
+    "blaude-mlx": { "backend": "mlx", "model": "mlx-community/Qwen3-27B-4bit", "maxContext": 131072, "maxOutput": 8192 }
+  },
+
+  "defaultModel": "blaude",
+
+  "routes": [
+    { "match": "*haiku*", "model": "blaude-small" },
+    { "match": "*", "model": "blaude" }
+  ],
+
+  "policy": {
+    "//mode": "local-only | local-first | claude-first | split",
+    "mode": "claude-first",
+
+    "//source": "usage-command reads exact percentages from `claude /usage` (free). claude-code estimates from transcripts. gateway counts only what Blaude forwarded.",
+    "source": "usage-command",
+
+    "//floors": "Minimum allowance that must REMAIN for this purpose to use Claude. 1 (or 100) means never. Accepts 20, 0.2 or \"20%\".",
+    "floors": {
+      "main": 20,
+      "tools": 10,
+      "audit": 5,
+      "background": 100
+    },
+
+    "//limits": "Only used by the fallback estimator and the simulator; `blaude calibrate --write` fills these in.",
+    "limits": {
+      "session": { "period": "5h", "amount": 0 },
+      "weekly": { "period": "week", "amount": 0 }
+    },
+
+    "//cloudTransport": "cli uses the official claude CLI (your subscription). api uses ANTHROPIC_API_KEY and costs credits.",
+    "cloudTransport": "cli",
+
+    "cloudModels": { "main": "sonnet", "tools": "haiku", "audit": "opus", "background": "haiku" },
+    "localModels": { "main": null, "tools": null, "audit": null, "background": "blaude-small" },
+
+    "//handoff": "Never switch destination mid-turn: re-caching a long conversation on Claude is expensive, so the switch lands on the next prompt.",
+    "handoff": { "stickyTurns": true, "hardStopFraction": 0.02, "announce": true },
+
+    "//capabilityRouting": "Send a request to Claude when the local model cannot serve it at all, on its own bounded floor.",
+    "capabilityRouting": { "toolsRequireClaude": false, "floor": 0.05 },
+
+    "onExhausted": "local"
+  },
+
+  "//thinking": "strip drops reasoning traces; text folds them into the reply.",
+  "thinking": "strip",
+  "textToolCalls": true,
+
+  "contextFit": { "enabled": true, "reserveOutput": 4096, "maxToolResultChars": 4000 },
+
+  "//pricing": "Optional, only for cost estimates in `blaude stats`. Blaude ships no guessed prices.",
+  "pricing": {
+    "referenceModel": "claude-sonnet-4-5",
+    "rates": { "claude-sonnet-4-5": { "inputPerMTok": 0, "outputPerMTok": 0 } }
+  }
+}

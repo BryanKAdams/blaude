@@ -1,0 +1,25 @@
+{
+  "name": "blaude",
+  "version": "0.1.0",
+  "description": "Local-first gateway that lets Claude Code drive a local model over the Anthropic wire protocol, escalating to Claude only when you ask.",
+  "type": "module",
+  "bin": {
+    "blaude": "./bin/blaude.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "serve": "node bin/blaude.mjs serve",
+    "doctor": "node bin/blaude.mjs doctor"
+  },
+  "files": [
+    "bin",
+    "src",
+    "blaude.config.example.json",
+    "README.md"
+  ],
+  "license": "MIT",
+  "private": true
+}

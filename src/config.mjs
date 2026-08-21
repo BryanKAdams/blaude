@@ -1,0 +1,169 @@
+// Config loading + defaults. No dependencies: JSON on disk, env overrides.
+import { readFileSync, existsSync, mkdirSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join, resolve } from 'node:path';
+
+export const BLAUDE_HOME = process.env.BLAUDE_HOME || join(homedir(), '.blaude');
+
+/**
+ * Defaults are deliberately conservative: everything stays local, and the only
+ * way a request reaches a paid API is an explicit `cloud/` model prefix or a
+ * route the user added themselves.
+ */
+export const DEFAULTS = {
+  host: '127.0.0.1',
+  port: 8817,
+
+  backends: {
+    // Already installed on most Macs that have played with local models.
+    // Native API rather than the OpenAI shim: it accepts options.num_ctx and
+    // handles tools/images more faithfully. See src/ollama-backend.mjs.
+    ollama: { kind: 'ollama', baseUrl: 'http://127.0.0.1:11434', apiKey: null },
+    // `mlx_lm.server --port 8081` — see scripts/setup-mlx.sh
+    mlx: { kind: 'openai', baseUrl: 'http://127.0.0.1:8081/v1', apiKey: 'mlx' },
+    // Only reachable via an explicit `cloud/` prefix or a user-added route.
+    anthropic: { kind: 'anthropic', baseUrl: 'https://api.anthropic.com', apiKeyEnv: 'ANTHROPIC_API_KEY' },
+  },
+
+  // Logical model names Claude Code (or you) can ask for.
+  models: {
+    blaude: { backend: 'ollama', model: 'qwen3:8b', maxContext: 65536, maxOutput: 8192 },
+    'blaude-small': { backend: 'ollama', model: 'qwen3:4b', maxContext: 32768, maxOutput: 4096 },
+  },
+
+  // First match wins. `match` is a glob over the requested model id.
+  routes: [
+    // Claude Code's cheap background model (titles, summaries) -> smallest local.
+    { match: '*haiku*', model: 'blaude-small' },
+    // Everything else Claude Code asks for (sonnet, opus, ...) -> local default.
+    { match: '*', model: 'blaude' },
+  ],
+
+  defaultModel: 'blaude',
+
+  // How to handle reasoning traces from local reasoning models.
+  //   strip -> drop them (safest; Claude Code never sees an unsigned thinking block)
+  //   text  -> fold them into the visible text
+  thinking: 'strip',
+
+  // Parse `<tool_call>{...}</tool_call>` emitted as plain text by models whose
+  // server-side tool support is weak or absent.
+  textToolCalls: true,
+
+  // Emitted only when the upstream server does not report usage itself.
+  estimateUsage: true,
+
+  // How `blaude` launches a session.
+  //
+  //   auto    -> when policy says Claude, launch a NATIVE Claude session (no
+  //              gateway in the path). Fastest and cheapest for Claude-heavy
+  //              work because prompt caching stays intact, but Blaude cannot
+  //              route mid-session, so the guard hook is what stops an overrun.
+  //   gateway -> ALWAYS route through Blaude. Every request is policy-checked,
+  //              the handoff is automatic at the next prompt, and no hook is
+  //              needed. Claude-served turns pay escalation overhead
+  //              (~2.6k tokens warm, ~8.5k cold) instead of using the cache.
+  //
+  // Pick `gateway` if never touching usage credits matters more than squeezing
+  // the most out of Claude while you have allowance.
+  launch: 'auto',
+
+  // Tools that do not function when a local model is driving.
+  //
+  // WebSearch is the proven case: it is a client-side tool, so a local model CAN
+  // call it and Claude Code WILL execute it — but the search itself runs against
+  // Anthropic's service, which a local session cannot authenticate to, so results
+  // come back empty. A small model handed an empty result set tends to answer
+  // from memory and invent a citation, which is worse than having no tool.
+  //
+  // Removing the tool makes the model say it cannot search, which is the truth.
+  // Set `drop: []` to keep them, or add your own (an MCP search server gives the
+  // local model a real web path that does not depend on Anthropic).
+  localToolPolicy: { drop: ['WebSearch'], note: true },
+
+  // Deliberate prompt trimming when a request exceeds the backend's real
+  // context window. Beats letting the server drop the front of the prompt.
+  contextFit: { enabled: true, reserveOutput: 4096, maxToolResultChars: 4000 },
+
+  // Policy defaults live in policy.mjs (DEFAULT_POLICY); anything set here wins.
+  policy: {},
+
+  // Optional {referenceModel, rates:{model:{inputPerMTok,outputPerMTok}}}.
+  // Empty by default: Blaude does not ship guessed prices.
+  pricing: {},
+
+  usageLog: join(BLAUDE_HOME, 'usage.jsonl'),
+  logLevel: process.env.BLAUDE_LOG_LEVEL || 'info',
+};
+
+function deepMerge(base, override) {
+  if (Array.isArray(override)) return override.slice();
+  if (override === null || typeof override !== 'object') return override;
+  const out = { ...(base && typeof base === 'object' ? base : {}) };
+  for (const [k, v] of Object.entries(override)) out[k] = deepMerge(out[k], v);
+  return out;
+}
+
+export function configPathCandidates(cwd = process.cwd()) {
+  const paths = [];
+  if (process.env.BLAUDE_CONFIG) paths.push(resolve(process.env.BLAUDE_CONFIG));
+  paths.push(join(cwd, 'blaude.config.json'));
+  paths.push(join(BLAUDE_HOME, 'config.json'));
+  return paths;
+}
+
+export function loadConfig({ cwd = process.cwd(), env = process.env } = {}) {
+  let fileConfig = {};
+  let source = '(defaults)';
+  for (const p of configPathCandidates(cwd)) {
+    if (!existsSync(p)) continue;
+    try {
+      fileConfig = JSON.parse(readFileSync(p, 'utf8'));
+      source = p;
+    } catch (err) {
+      throw new Error(`Blaude config at ${p} is not valid JSON: ${err.message}`);
+    }
+    break;
+  }
+
+  const cfg = deepMerge(DEFAULTS, fileConfig);
+  cfg.configSource = source;
+
+  // Env overrides win over the file so one-off runs stay easy.
+  if (env.BLAUDE_PORT) cfg.port = Number(env.BLAUDE_PORT);
+  if (env.BLAUDE_HOST) cfg.host = env.BLAUDE_HOST;
+  if (env.BLAUDE_MODEL) cfg.defaultModel = env.BLAUDE_MODEL;
+  if (env.BLAUDE_THINKING) cfg.thinking = env.BLAUDE_THINKING;
+  if (env.BLAUDE_BACKEND_URL) {
+    // Point the default model's backend somewhere else without editing config.
+    const target = cfg.models[cfg.defaultModel];
+    if (target) cfg.backends[target.backend] = { ...cfg.backends[target.backend], baseUrl: env.BLAUDE_BACKEND_URL };
+  }
+  if (env.BLAUDE_TEXT_TOOL_CALLS === '0') cfg.textToolCalls = false;
+
+  validateConfig(cfg);
+  return cfg;
+}
+
+export function validateConfig(cfg) {
+  for (const [name, m] of Object.entries(cfg.models)) {
+    if (!m.backend) throw new Error(`Model "${name}" is missing "backend"`);
+    if (!cfg.backends[m.backend]) throw new Error(`Model "${name}" references unknown backend "${m.backend}"`);
+    if (!m.model) throw new Error(`Model "${name}" is missing the upstream "model" id`);
+  }
+  if (!cfg.models[cfg.defaultModel]) {
+    throw new Error(`defaultModel "${cfg.defaultModel}" is not defined in "models"`);
+  }
+  for (const r of cfg.routes) {
+    if (!r.match) throw new Error('Every route needs a "match" glob');
+    if (r.model && !cfg.models[r.model] && !r.backend) {
+      throw new Error(`Route "${r.match}" targets unknown model "${r.model}"`);
+    }
+  }
+  return cfg;
+}
+
+export function ensureHome() {
+  if (!existsSync(BLAUDE_HOME)) mkdirSync(BLAUDE_HOME, { recursive: true });
+  return BLAUDE_HOME;
+}

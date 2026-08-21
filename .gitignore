@@ -1,0 +1,8 @@
+node_modules/
+*.log
+
+# Blaude keeps all state in ~/.blaude, never in the repo:
+#   config.json, usage.jsonl, capabilities.json, notes/, gateway.log
+# Nothing here should ever hold credentials.
+blaude.config.json
+.DS_Store
