@@ -46,7 +46,7 @@ export async function loadedContexts(baseUrl = 'http://127.0.0.1:11434') {
  * Plan (and optionally perform) raising the cap.
  * @returns {{steps:Array<{描述?:string, description:string, command:string}>, flavour:string|null}}
  */
-export function planContextChange(tokens, detected = detectOllama()) {
+export function planContextChange(tokens, detected = detectOllama(), { kvType = null } = {}) {
   const value = String(Math.max(2048, Math.floor(tokens)));
   const steps = [];
 
@@ -57,6 +57,21 @@ export function planContextChange(tokens, detected = detectOllama()) {
     command: `launchctl setenv OLLAMA_CONTEXT_LENGTH ${value}`,
     argv: ['launchctl', ['setenv', 'OLLAMA_CONTEXT_LENGTH', value]],
   });
+
+  // A quantised KV cache is what makes a very large context fit in unified
+  // memory, and Ollama only honours it with flash attention enabled.
+  if (kvType && kvType !== 'f16') {
+    steps.push({
+      description: 'enable flash attention (required for a quantised KV cache)',
+      command: 'launchctl setenv OLLAMA_FLASH_ATTENTION 1',
+      argv: ['launchctl', ['setenv', 'OLLAMA_FLASH_ATTENTION', '1']],
+    });
+    steps.push({
+      description: `set the KV cache type to ${kvType}, which is what makes ${Number(value).toLocaleString()} tokens fit`,
+      command: `launchctl setenv OLLAMA_KV_CACHE_TYPE ${kvType}`,
+      argv: ['launchctl', ['setenv', 'OLLAMA_KV_CACHE_TYPE', kvType]],
+    });
+  }
 
   if (detected.flavour === 'app') {
     // `killall` rather than AppleScript: telling an app to quit via osascript
@@ -144,4 +159,77 @@ export async function residentContext(baseUrl, model, { ttlMs = 10_000 } = {}) {
   }
   const hit = residentCache.value.find((m) => m.name === model || m.name?.startsWith(model));
   return hit?.contextLength ?? null;
+}
+
+// ---------------------------------------------------------------------------
+// Can this machine actually hold that context?
+// ---------------------------------------------------------------------------
+
+/**
+ * KV cache cost per token, from the model's own architecture.
+ *
+ * Two tensors (K and V) per layer, sized by the number of key/value heads times
+ * the head dimension. This is what makes a big context expensive: it scales
+ * linearly with context length AND with model depth, so a 65-layer model pays
+ * far more per token than a 36-layer one.
+ */
+export async function modelMemoryProfile(baseUrl, model) {
+  const res = await fetch(`${baseUrl.replace(/\/+$/, '')}/api/show`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ model }),
+    signal: AbortSignal.timeout(20_000),
+  });
+  if (!res.ok) throw new Error(`could not inspect "${model}" (HTTP ${res.status})`);
+  const body = await res.json();
+  const info = body.model_info || {};
+  const pick = (suffix) => {
+    const key = Object.keys(info).find((k) => k.endsWith(suffix));
+    return key ? info[key] : null;
+  };
+
+  const layers = pick('block_count');
+  const kvHeads = pick('attention.head_count_kv');
+  const heads = pick('attention.head_count');
+  const embedding = pick('embedding_length');
+  let headDim = pick('attention.key_length');
+  if (!headDim && embedding && heads) headDim = Math.floor(embedding / heads);
+  const modelMaxContext = pick('context_length');
+
+  const bytesPerTokenFp16 = layers && kvHeads && headDim ? 2 * layers * kvHeads * headDim * 2 : null;
+  return {
+    model,
+    layers,
+    kvHeads,
+    headDim,
+    modelMaxContext,
+    bytesPerTokenFp16,
+    parameterSize: body.details?.parameter_size ?? null,
+    quantization: body.details?.quantization_level ?? null,
+    capabilities: body.capabilities || [],
+  };
+}
+
+export const KV_TYPES = { f16: 1, q8_0: 2, q4_0: 4 };
+
+/**
+ * Work out which KV cache type (if any) makes `tokens` of context fit.
+ *
+ * `weightsBytes` is taken from the installed model size, and a slice of memory
+ * is held back for macOS and everything else you have open — a context that
+ * technically fits but leaves nothing for the system will swap, which is far
+ * slower than a smaller context.
+ */
+export function planMemory({ profile, tokens, weightsBytes, totalBytes, reserveBytes = 12e9 }) {
+  const budget = totalBytes - reserveBytes - weightsBytes;
+  const options = Object.entries(KV_TYPES).map(([type, divisor]) => {
+    const kvBytes = profile.bytesPerTokenFp16 ? (profile.bytesPerTokenFp16 * tokens) / divisor : null;
+    return { type, kvBytes, totalBytes: kvBytes == null ? null : kvBytes + weightsBytes, fits: kvBytes != null && kvBytes <= budget };
+  });
+  return {
+    budget,
+    options,
+    exceedsModelMax: Boolean(profile.modelMaxContext && tokens > profile.modelMaxContext),
+    recommended: options.find((o) => o.fits) || null,
+  };
 }

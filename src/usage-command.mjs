@@ -120,7 +120,12 @@ export function readUsageCommand({
 // Cached reads, for callers that must be instant
 // ---------------------------------------------------------------------------
 
-const CACHE_FILE = () => join(BLAUDE_HOME, 'usage-cache.json');
+/**
+ * One cache file per account. A shared file would hand one account's remaining
+ * allowance to another's session — the readings look plausible and are simply
+ * about the wrong subscription.
+ */
+const CACHE_FILE = (key = null) => join(BLAUDE_HOME, key ? `usage-cache-${key}.json` : 'usage-cache.json');
 
 /**
  * Read `/usage` through a short-lived cache.
@@ -132,10 +137,10 @@ const CACHE_FILE = () => join(BLAUDE_HOME, 'usage-cache.json');
  *
  * @returns {Promise<{windows:object, cachedAt:number, stale:boolean}|null>}
  */
-export async function readUsageCached({ ttlMs = 60_000, allowStale = true } = {}) {
+export async function readUsageCached({ ttlMs = 60_000, allowStale = true, accountKey = null } = {}) {
   let cached = null;
   try {
-    if (existsSync(CACHE_FILE())) cached = JSON.parse(readFileSync(CACHE_FILE(), 'utf8'));
+    if (existsSync(CACHE_FILE(accountKey))) cached = JSON.parse(readFileSync(CACHE_FILE(accountKey), 'utf8'));
   } catch { /* a corrupt cache is just a cache miss */ }
 
   const age = cached ? Date.now() - (cached.cachedAt || 0) : Infinity;
@@ -147,14 +152,14 @@ export async function readUsageCached({ ttlMs = 60_000, allowStale = true } = {}
   }
 
   const fresh = await readUsageCommand();
-  writeUsageCache(fresh);
+  writeUsageCache(fresh, accountKey);
   return { windows: fresh.windows, subscription: fresh.subscription, cachedAt: Date.now(), stale: false };
 }
 
-export function writeUsageCache(report) {
+export function writeUsageCache(report, accountKey = null) {
   try {
     if (!existsSync(BLAUDE_HOME)) mkdirSync(BLAUDE_HOME, { recursive: true });
-    writeFileSync(CACHE_FILE(), JSON.stringify({
+    writeFileSync(CACHE_FILE(accountKey), JSON.stringify({
       windows: report.windows,
       subscription: report.subscription,
       cachedAt: Date.now(),

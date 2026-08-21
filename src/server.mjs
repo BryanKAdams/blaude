@@ -3,6 +3,7 @@ import { createServer } from 'node:http';
 import { watch } from 'node:fs';
 import { performance } from 'node:perf_hooks';
 import { loadConfig } from './config.mjs';
+import { readAccount, describeAccount } from './account.mjs';
 import { resolveModel, RouteError } from './router.mjs';
 import { anthropicToOpenAI, flattenSystem, TranslateError } from './anthropic-to-openai.mjs';
 import { openAIToAnthropic, estimateTokens, newMessageId } from './openai-to-anthropic.mjs';
@@ -74,24 +75,37 @@ export function createGateway(cfg) {
     policy: normalizePolicy(cfg.policy || {}),
     meter: null,
     affinity: new TurnAffinity(),
+    // A gateway serves exactly one account's allowance. Anything pointed at it
+    // from a different account would be routed on the wrong numbers, so the
+    // account it serves is published and the launcher checks it.
+    account: null,
   };
+  readAccount().then((a) => { state.account = a; }).catch(() => {});
   state.meter = new AllowanceMeter({ policy: state.policy });
 
   function reloadConfig(reason) {
     try {
       const next = loadConfig();
       const nextPolicy = normalizePolicy(next.policy || {});
-      const changed = JSON.stringify(nextPolicy) !== JSON.stringify(state.policy)
-        || next.defaultModel !== cfg.defaultModel;
-      if (!changed) return false;
+
+      // Compare everything that changes how a request is served, not just the
+      // policy. An earlier version compared only policy and defaultModel, so
+      // swapping models.blaude.model was invisible: the gateway went on serving
+      // the previous model while every other signal said it had switched.
+      const signature = (c, pol) => JSON.stringify([
+        pol, c.defaultModel, c.models, c.backends, c.routes,
+        c.thinking, c.textToolCalls, c.contextFit, c.localSession, c.localToolPolicy,
+      ]);
+      if (signature(next, nextPolicy) === signature(cfg, state.policy)) return false;
 
       Object.assign(cfg, next);
       state.policy = nextPolicy;
       // A fresh meter, because limits and unit may have moved with the policy.
       state.meter = new AllowanceMeter({ policy: nextPolicy });
+      const target = next.models[next.defaultModel];
       log.info(
         `\x1b[36mconfig reloaded\x1b[0m (${reason}) — mode ${nextPolicy.mode}, ` +
-        `local ${next.defaultModel}, floors ` +
+        `local ${next.defaultModel} -> ${target?.backend}/${target?.model} (ctx ${target?.maxContext}), floors ` +
         Object.entries(nextPolicy.floors).map(([k, v]) => `${k}=${v >= 1 ? 'local' : `${Math.round(v * 100)}%`}`).join(' '),
       );
       return true;
@@ -134,6 +148,7 @@ export function createGateway(cfg) {
           ),
           counters,
           configSource: cfg.configSource,
+          account: state.account ? { email: state.account.email, key: state.account.key } : null,
         });
       }
 
@@ -159,6 +174,7 @@ export function createGateway(cfg) {
           uncalibrated: state.meter.uncalibrated,
           routing: explainPolicy(state.policy, state.meter),
           defaultModel: cfg.defaultModel,
+          account: state.account ? { email: state.account.email, key: state.account.key, plan: state.account.subscriptionType } : null,
           counters,
         });
       }
@@ -695,6 +711,7 @@ export function startGateway(cfg) {
       log.plain(tight
         ? `  allowance      ${pct(tight.fractionRemaining)} of ${tight.name} left (${fmt(tight.spent)}/${fmt(tight.amount)} ${policy.unit})`
         : `  allowance      not calibrated — run \x1b[90mblaude calibrate\x1b[0m to enable Claude routing`);
+      log.plain(`  account        ${describeAccount(server.blaude.state.account)}`);
       log.plain(`  config         ${cfg.configSource}`);
       log.plain('');
       resolve({ server, log });

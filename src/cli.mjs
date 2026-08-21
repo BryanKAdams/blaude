@@ -2,6 +2,7 @@
 import { spawn, spawnSync } from 'node:child_process';
 import { writeFileSync, existsSync, readFileSync, openSync } from 'node:fs';
 import { join } from 'node:path';
+import { totalmem } from 'node:os';
 import { loadConfig, BLAUDE_HOME, ensureHome, DEFAULTS } from './config.mjs';
 import { startGateway } from './server.mjs';
 import {
@@ -18,8 +19,9 @@ import { resolveModel } from './router.mjs';
 import { readUsage, summarize } from './usage.mjs';
 import { escalateViaCLI, runClaudeCLI } from './claude-cli.mjs';
 import { simulate, loadHistory } from './simulate.mjs';
-import { detectOllama, loadedContexts, planContextChange, applyStep, waitForOllama } from './ollama-admin.mjs';
+import { detectOllama, loadedContexts, planContextChange, applyStep, waitForOllama, modelMemoryProfile, planMemory } from './ollama-admin.mjs';
 import { listSessions, digestSession, appendNote, readNotes } from './handoff.mjs';
+import { readAccount, describeAccount, portForAccount } from './account.mjs';
 
 const C = {
   bold: (s) => `\x1b[1m${s}\x1b[0m`,
@@ -65,6 +67,31 @@ async function gatewayHealth(cfg, timeoutMs = 1200) {
     const res = await fetch(`http://${cfg.host}:${cfg.port}/health`, { signal: AbortSignal.timeout(timeoutMs) });
     return res.ok ? await res.json() : null;
   } catch { return null; }
+}
+
+/**
+ * Bind the gateway to this terminal's account.
+ *
+ * Allowance belongs to an account, and the gateway reads it once under its own
+ * environment. Sharing one gateway between two signed-in accounts routes both on
+ * whichever account started it — plausible-looking numbers about the wrong
+ * subscription. Each account gets its own port instead.
+ */
+export async function scopeConfigToAccount(cfg, { quiet = false } = {}) {
+  if (cfg.accountScopedPort === false) return cfg;
+  const account = await readAccount().catch(() => null);
+  if (!account) return cfg;
+
+  const port = portForAccount(cfg.port, account);
+  if (port !== cfg.port) {
+    const health = await gatewayHealth(cfg, 600);
+    if (health?.account && health.account.key !== account.key && !quiet) {
+      note(`  ${C.dim(`gateway on ${cfg.port} belongs to ${health.account.email}; using ${port} for ${account.email}`)}`);
+    }
+    cfg.port = port;
+  }
+  cfg.account = account;
+  return cfg;
 }
 
 async function ensureGateway(cfg, { quiet = false } = {}) {
@@ -517,7 +544,7 @@ export async function cmdServe() {
 
 export async function cmdStatus(argv) {
   const { flags } = parseFlags(argv);
-  const cfg = loadConfig();
+  const cfg = await scopeConfigToAccount(loadConfig(), { quiet: true });
   const { policy, meter } = await meterFor(cfg);
 
   if (flags.json) {
@@ -533,6 +560,7 @@ export async function cmdStatus(argv) {
     gateway: 'only traffic through this gateway',
   }[meter.effectiveSource || policy.source] || policy.source;
   out(`  ${C.dim(`allowance source: ${sourceLabel}`)}`);
+  out(`  ${C.dim(`account: ${describeAccount(cfg.account)}`)}`);
   if (meter.lastError) out(`  ${C.yellow('!')} ${C.dim(`/usage unavailable (${meter.lastError}) — fell back to estimates`)}`);
   out('');
   out(`  ${C.bold('Allowance')}`);
@@ -683,9 +711,9 @@ export async function cmdUsage(argv) {
 
 export async function cmdMode(argv) {
   const { flags, positional } = parseFlags(argv);
+  const cfg = loadConfig();
   const mode = positional[0] ? resolveModeName(positional[0]) : positional[0];
   if (!mode) {
-    const cfg = loadConfig();
     const current = normalizePolicy(cfg.policy || {});
     out('');
     out(`  current mode: ${C.cyan(current.mode)}`);
@@ -750,6 +778,34 @@ export async function cmdMode(argv) {
   }
   out(`  ${C.dim('effective floors: ' + PURPOSES.map((p) => `${p}=${effective.floors[p] >= NEVER ? 'local' : pct(effective.floors[p])}`).join('  '))}`);
   out(C.dim(`  ${file}`));
+
+  // A mode that intends Claude to do the work cannot deliver it in every launch
+  // configuration. Say so here rather than letting it look like it is working.
+  const wantsClaudeForWork = (effective.floors?.main ?? NEVER) < NEVER;
+  const relayOff = effective.cloudTransport === 'cli' && effective.experimentalRelay === false;
+  const inPath = cfg.launch === 'gateway';
+
+  if (wantsClaudeForWork && inPath && relayOff) {
+    out('');
+    out(`  ${C.yellow('!')} This combination cannot send ordinary turns to Claude.`);
+    out(`    ${C.dim(`mode ${mode} wants Claude for main turns, but launch=gateway keeps Blaude in the`)}`);
+    out(`    ${C.dim('request path, and per-turn relay is off because it measured at ~2x the tokens')}`);
+    out(`    ${C.dim('of a native session and did not finish reliably. Ordinary turns stay local.')}`);
+    out('');
+    out(`    For Claude to actually do the work:  ${C.cyan('blaude route auto')}`);
+    out(`    ${C.dim('(then `blaude guard on` so a native session still stops at your floor)')}`);
+    out(`    To relay anyway:                     ${C.cyan('policy.experimentalRelay = true')}`);
+  }
+
+  const meterNow = new AllowanceMeter({ policy: effective });
+  await meterNow.refresh(true).catch(() => {});
+  const tight = meterNow.tightest();
+  if (wantsClaudeForWork && tight && tight.fractionRemaining <= (effective.floors.main ?? 0)) {
+    out('');
+    out(`  ${C.yellow('!')} Right now this behaves like local-only: ${pct(tight.fractionRemaining)} of your`);
+    out(`    ${tight.name} allowance is left, under the ${pct(effective.floors.main)} floor for ordinary turns.`);
+    if (tight.resetsAt) out(`    ${C.dim(`Resets ${tight.resetsAt}.`)}`);
+  }
 }
 
 export async function cmdWhy(argv) {
@@ -1389,6 +1445,7 @@ export async function cmdSearch(argv) {
 export async function cmdOllama(argv) {
   const { flags, positional } = parseFlags(argv);
   const [sub, value] = positional;
+  const cfg = loadConfig();
   const detected = detectOllama();
 
   if (!sub || sub === 'status') {
@@ -1412,14 +1469,65 @@ export async function cmdOllama(argv) {
   }
 
   if (sub !== 'context') throw new Error(`Unknown subcommand "${sub}". Use: blaude ollama [status|context <tokens>]`);
-  const tokens = Number(value);
-  if (!Number.isFinite(tokens) || tokens < 2048) throw new Error('Give a context size in tokens, e.g. `blaude ollama context 65536`');
+  const tokens = Number(String(value).replace(/[_,]/g, '').replace(/k$/i, '000'));
+  if (!Number.isFinite(tokens) || tokens < 2048) throw new Error('Give a context size in tokens, e.g. `blaude ollama context 200000`');
 
-  const plan = planContextChange(tokens, detected);
+  // Work out whether that context can actually be held, from the model's own
+  // architecture and this machine's memory, rather than finding out by swapping.
+  const backendName = cfg.models[cfg.defaultModel]?.backend || 'ollama';
+  const backend = cfg.backends[backendName];
+  const modelName = cfg.models[cfg.defaultModel]?.model;
+  let profile = null;
+  let memPlan = null;
+  let weightsBytes = 0;
+  try {
+    profile = await modelMemoryProfile(backend.baseUrl, modelName);
+    const tags = await fetch(`${backend.baseUrl.replace(/\/+$/, '')}/api/tags`, { signal: AbortSignal.timeout(8000) }).then((r) => r.json());
+    weightsBytes = (tags.models || []).find((m) => m.name === modelName)?.size || 0;
+    memPlan = planMemory({ profile, tokens, weightsBytes, totalBytes: totalmem() });
+  } catch (err) {
+    out(`  ${C.yellow('!')} could not inspect ${modelName} (${err.message}) — proceeding without a memory check`);
+  }
+
   out('');
-  out(`  ${C.bold(`Raise Ollama's context cap to ${plan.value.toLocaleString()} tokens`)}`);
-  out(`  ${C.dim('A bigger context costs RAM: the KV cache grows with context length and model')}`);
-  out(`  ${C.dim('size, and it competes with the weights for your unified memory.')}`);
+  out(`  ${C.bold(`Context cap -> ${tokens.toLocaleString()} tokens`)} ${C.dim(`for ${modelName}`)}`);
+
+  if (memPlan?.exceedsModelMax) {
+    out('');
+    out(`  ${C.red('✗')} ${modelName} tops out at ${profile.modelMaxContext.toLocaleString()} tokens — that is the`);
+    out(`    model's own architecture, not an Ollama setting, so no configuration reaches`);
+    out(`    ${tokens.toLocaleString()}. Pick a model with a longer context, or ask for`);
+    out(`    ${C.cyan(`blaude ollama context ${profile.modelMaxContext}`)}.`);
+    out('');
+    return;
+  }
+
+  let kvType = flags.kv || null;
+  if (memPlan) {
+    const perTok = profile.bytesPerTokenFp16 / 1024;
+    out(`  ${C.dim(`${profile.layers} layers · ${profile.kvHeads} kv heads · ${perTok.toFixed(0)} KB/token at f16 · weights ${(weightsBytes / 1e9).toFixed(1)} GB`)}`);
+    out('');
+    for (const o of memPlan.options) {
+      const label = `KV ${o.type}`.padEnd(9);
+      const line = `${label} cache ${(o.kvBytes / 1e9).toFixed(1).padStart(5)} GB  resident ${(o.totalBytes / 1e9).toFixed(1).padStart(5)} GB`;
+      out(`    ${o.fits ? C.green('✓') : C.red('✗')} ${line}${o.fits ? '' : C.dim('  — would not leave enough for the system')}`);
+    }
+    if (!kvType) kvType = memPlan.recommended?.type ?? null;
+    out('');
+    if (!kvType) {
+      out(`  ${C.red('✗')} ${tokens.toLocaleString()} tokens does not fit at any KV cache type on this machine.`);
+      out(`    ${C.dim('Try a smaller context, or a smaller/more heavily quantised model.')}`);
+      out('');
+      return;
+    }
+    out(`  using ${C.cyan(`KV ${kvType}`)}${kvType !== 'f16' ? C.dim(' (quantised cache — needs flash attention, set below)') : ''}`);
+    if (kvType === 'q4_0') out(`  ${C.yellow('!')} q4_0 is a lossy cache; q8_0 is closer to lossless if it fits.`);
+  }
+
+  const plan = planContextChange(tokens, detected, { kvType });
+  out('');
+  out(`  ${C.dim('A bigger context is allocated up front, so it costs memory even when your')}`);
+  out(`  ${C.dim('prompts are short. It does not make short prompts slower.')}`);
   out('');
   plan.steps.forEach((s, i) => {
     out(`  ${i + 1}. ${s.description}`);
@@ -1445,8 +1553,8 @@ export async function cmdOllama(argv) {
   }
   const back = await waitForOllama();
   out(`  ${back ? C.green('✓') : C.yellow('!')} Ollama ${back ? 'is back up' : 'has not come back yet — check the app'}`);
-  writeConfigPatch({ models: { blaude: { maxContext: plan.value } } });
-  out(`  ${C.green('✓')} recorded maxContext ${plan.value} for the default model`);
+  writeConfigPatch({ models: { [cfg.defaultModel]: { maxContext: plan.value } } });
+  out(`  ${C.green('✓')} recorded maxContext ${plan.value.toLocaleString()} for ${cfg.defaultModel}`);
   out(`  ${C.dim('verify with: blaude doctor')}`);
   out('');
 }
