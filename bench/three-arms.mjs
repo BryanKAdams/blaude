@@ -119,7 +119,74 @@ async function armD() {
   const r = await run('node', [BLAUDE, '--local', '-p', '--output-format', 'json', '--allowedTools', 'Read,Glob'], { input: TASK });
   const t1 = Date.now();
   const j = result(r);
-  return { name: 'D local-only', ms: t1 - t0, text: j.result || r.out, turns: j.num_turns ?? null, spend: await claudeSpend(t0, t1, known) };
+  // Each assistant turn, so a per-turn reviewer can see the work unfold.
+  const turnTexts = [];
+  try {
+    const { readFileSync, readdirSync } = await import('node:fs');
+    const { join } = await import('node:path');
+    const dir = join(process.env.HOME, '.claude', 'projects', ROOT.replace(/\//g, '-'));
+    const newest = readdirSync(dir).filter((f) => f.endsWith('.jsonl'))
+      .map((f) => ({ f, t: readFileSync(join(dir, f), 'utf8') }))
+      .sort((a, b) => b.t.length - a.t.length)[0];
+    for (const line of (newest?.t || '').split('\n')) {
+      if (!line.includes('"assistant"')) continue;
+      try {
+        const rec = JSON.parse(line);
+        const text = (rec.message?.content || []).map((b) =>
+          b.type === 'text' ? b.text : b.type === 'tool_use' ? `[called ${b.name} ${JSON.stringify(b.input)}]` : '').join(' ').trim();
+        if (text) turnTexts.push(text.slice(0, 1500));
+      } catch { /* skip */ }
+    }
+  } catch { /* transcript is a bonus, not required */ }
+  return { name: 'D local-only', ms: t1 - t0, text: j.result || r.out, turns: j.num_turns ?? null,
+    turnTexts, spend: await claudeSpend(t0, t1, known) };
+}
+
+/**
+ * The arrangement this project is actually for: the local model does every turn,
+ * and one persistent Claude session reviews each response as it happens —
+ * accumulating context, receiving only what is new.
+ *
+ * Implemented as a replay of arm D's turns so the (slow) local work is not paid
+ * for twice. Review cost is what a live inline reviewer would spend.
+ */
+async function armE(localArm) {
+  const known = await sessionsBefore(Date.now() - 7 * 86_400_000);
+  const t0 = Date.now();
+  const { escalateViaCLI, resetRelaySessions } = await import('../src/claude-cli.mjs');
+  resetRelaySessions();
+
+  const turns = localArm?.turnTexts?.length ? localArm.turnTexts : [String(localArm?.text || '')];
+  const key = 'bench-reviewer';
+  let verdicts = [];
+  let corrected = null;
+
+  for (let i = 0; i < turns.length; i++) {
+    const body = {
+      model: 'claude-sonnet-5',
+      max_tokens: 1024,
+      system: 'You are reviewing another model\'s work on a task, one turn at a time. '
+        + `The task: ${TASK}\n`
+        + 'For each turn, reply either "APPROVE" or "CORRECT: <the corrected two lines>". Be terse.',
+      messages: [{ role: 'user', content: `Turn ${i + 1} of the local model's work:\n\n${turns[i]}` }],
+    };
+    const r = await escalateViaCLI(body, {
+      model: process.env.BENCH_MODEL || 'sonnet', shape: 'oracle', sessionKey: key, cwd: ROOT,
+    });
+    const text = r.message.content.map((b) => b.text || '').join('');
+    verdicts.push({ turn: i + 1, reused: r.reusedSession, text: text.trim().slice(0, 120) });
+    if (/CORRECT/i.test(text)) corrected = text;
+  }
+  const t1 = Date.now();
+  return {
+    name: 'E local+reviewer',
+    ms: (localArm?.ms || 0) + (t1 - t0),
+    reviewMs: t1 - t0,
+    text: corrected || localArm?.text || '',
+    verdicts,
+    localText: localArm?.text,
+    spend: await claudeSpend(t0, t1, known),
+  };
 }
 
 async function armC() {
@@ -148,11 +215,13 @@ const fmt = (n) => (n >= 1e6 ? `${(n / 1e6).toFixed(2)}M` : n >= 1e3 ? `${(n / 1
 
 setup();
 const WANT = (process.env.BENCH_ARMS || 'ABC').toUpperCase();
-const chosen = [['A', armA], ['B', armB], ['C', armC], ['D', armD]]
-  .filter(([k]) => WANT.includes(k)).map(([, fn]) => fn);
+const ORDER = [['A', armA], ['B', armB], ['C', armC], ['D', armD], ['E', armE]];
+const chosen = ORDER.filter(([k]) => WANT.includes(k));
 const arms = [];
-for (const fn of chosen) {
-  const a = await fn();
+let localArm = null;
+for (const [key, fn] of chosen) {
+  const a = key === 'E' ? await fn(localArm) : await fn();
+  if (key === 'D') localArm = a;
   a.grade = grade(a.text);
   arms.push(a);
   console.error(`  done: ${a.name} (${(a.ms / 1000).toFixed(1)}s, ${fmt(a.spend.weighted)} weighted)`);
@@ -178,6 +247,11 @@ console.log('  what each arm actually replied:');
 for (const a of arms) {
   const oneLine = String(a.text || '').replace(/\s+/g, ' ').trim().slice(0, 150);
   console.log(`    ${a.name}: ${oneLine || '(empty)'}`);
+  if (a.verdicts) {
+    for (const v of a.verdicts) {
+      console.log(`      review turn ${v.turn} (${v.reused ? 'resumed' : 'new'} session): ${v.text}`);
+    }
+  }
   if (a.localText) {
     const lg = grade(a.localText);
     const before = String(a.localText).replace(/\s+/g, ' ').trim().slice(0, 110);

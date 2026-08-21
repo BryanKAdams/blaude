@@ -188,7 +188,9 @@ test('the meter falls back to estimates when /usage cannot be read', async () =>
 // --- CLI safety -------------------------------------------------------------
 // A mistyped command must never be silently sent as a prompt: above the floor
 // that would spend a Claude turn on a typo.
-const { nearestCommand } = await import('../src/cli.mjs');
+const cliModule = await import('../src/cli.mjs');
+const { nearestCommand } = cliModule;
+const require_cli = () => cliModule;
 
 test('a mistyped command is recognised as a near-miss', () => {
   assert.equal(nearestCommand('model'), 'mode');
@@ -235,4 +237,46 @@ test('the relay can be opted into explicitly', () => {
   const policy = normalizePolicy({ mode: 'claude-first', floors: { main: 0 }, experimentalRelay: true });
   const d = decide({ policy, meter: fakeMeter(0.9), body: freshTurn, requestedModel: 'm' });
   assert.equal(d.destination, 'cloud');
+});
+
+test('the launcher forwards every flag it does not own', () => {
+  const { splitLauncherArgs } = require_cli();
+  const { ours, passthrough } = splitLauncherArgs(
+    ['--local', '-p', '--output-format', 'json', '--allowedTools', 'Read,Glob', 'count the TODOs'],
+  );
+  assert.equal(ours.local, true);
+  assert.deepEqual(passthrough, ['-p', '--output-format', 'json', '--allowedTools', 'Read,Glob', 'count the TODOs'],
+    'anything Blaude does not own must reach claude untouched');
+});
+
+test('-- forces everything after it to pass through', () => {
+  const { splitLauncherArgs } = require_cli();
+  const { ours, passthrough } = splitLauncherArgs(['--', '--local', 'is a prompt word']);
+  assert.deepEqual(ours, {});
+  assert.deepEqual(passthrough, ['--local', 'is a prompt word']);
+});
+
+test('--local pins the gateway, not just the banner', () => {
+  const { localSessionEnv } = require_cli();
+  const cfg = { host: '127.0.0.1', port: 8817, defaultModel: 'blaude', models: { blaude: { maxContext: 40960 } } };
+  assert.equal(localSessionEnv(cfg).ANTHROPIC_MODEL, 'blaude', 'without --local the gateway decides');
+  assert.equal(localSessionEnv(cfg, { force: true }).ANTHROPIC_MODEL, 'local/blaude',
+    'with --local the model carries the prefix that forbids escalation');
+  assert.equal(localSessionEnv(cfg, { force: true }).ANTHROPIC_SMALL_FAST_MODEL, 'local/blaude-small');
+});
+
+test('a small local window suppresses compaction rather than declaring itself', () => {
+  const { localSessionEnv, localSessionArgs, needsCompactionGuard } = require_cli();
+  const small = { host: '127.0.0.1', port: 8817, defaultModel: 'blaude', models: { blaude: { maxContext: 40960 } }, localSession: {} };
+  const roomy = { host: '127.0.0.1', port: 8817, defaultModel: 'blaude', models: { blaude: { maxContext: 131072 } }, localSession: {} };
+
+  // Declaring 40k leaves ~12k of working room over Claude Code's base prompt,
+  // which sends auto-compact into a loop.
+  assert.equal(localSessionEnv(small).CLAUDE_CODE_MAX_CONTEXT_TOKENS, undefined);
+  assert.ok(needsCompactionGuard(small));
+  assert.ok(localSessionArgs(small).includes('--autocompact'));
+
+  assert.equal(localSessionEnv(roomy).CLAUDE_CODE_MAX_CONTEXT_TOKENS, '131072');
+  assert.ok(!needsCompactionGuard(roomy));
+  assert.ok(!localSessionArgs(roomy).includes('--autocompact'));
 });

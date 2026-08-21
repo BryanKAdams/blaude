@@ -127,6 +127,11 @@ export function localSessionArgs(cfg) {
   if (cfg.localSession?.disableMcp !== false) {
     args.push('--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}');
   }
+  // Push auto-compact beyond reach on a small local window, so Claude Code stops
+  // compacting in a loop and lets the context fitter do the trimming.
+  if (needsCompactionGuard(cfg) && cfg.localSession?.autocompactGuard !== false) {
+    args.push('--autocompact', '1000000');
+  }
   if (cfg.localSession?.disableBundledSkills) {
     args.push('--settings', JSON.stringify({ disableBundledSkills: true }));
   }
@@ -147,24 +152,40 @@ export function localSessionArgs(cfg) {
  * gateway process keeps its own environment, so `cloudTransport: "api"` still
  * finds ANTHROPIC_API_KEY if you configured it.
  */
-export function localSessionEnv(cfg) {
-  // Claude Code does not recognise a local model name, so it assumes a 200k
-  // context window and will not auto-compact until then — far past what the
-  // local model can hold. Tell it the truth so compaction happens at the right
-  // time instead of leaning on Blaude's fitter to amputate every request.
+export function localSessionEnv(cfg, { force = false } = {}) {
+  // Declaring a small window backfires. Claude Code's own base prompt is ~26-28k
+  // tokens, so telling it the window is 40k leaves ~12k of working room and
+  // auto-compact thrashes: compact, refill within three turns, compact again.
+  // Measured: a task that Claude finished in 8s never completed at all.
+  //
+  // So the window is declared only when it is roomy enough for compaction to be
+  // meaningful. Below that, auto-compact is pushed out of the way and Blaude's
+  // context fitter trims each request instead — it drops the oldest tool output
+  // first, which degrades far more gracefully than a compaction loop.
   const model = cfg.models[cfg.defaultModel];
-  const window = model?.maxContext || null;
+  const maxContext = model?.maxContext || null;
+  const ROOMY = 64_000;
+  const window = maxContext && maxContext >= ROOMY ? maxContext : null;
 
   return {
     ANTHROPIC_BASE_URL: `http://${cfg.host}:${cfg.port}`,
     ANTHROPIC_API_KEY: undefined,
     ANTHROPIC_AUTH_TOKEN: undefined,
-    ANTHROPIC_MODEL: cfg.defaultModel,
-    ANTHROPIC_SMALL_FAST_MODEL: 'blaude-small',
-    ANTHROPIC_DEFAULT_HAIKU_MODEL: 'blaude-small',
+    // `--local` must bind the GATEWAY, not just this banner. The gateway decides
+    // per request, so without the explicit prefix it can still escalate a turn to
+    // Claude — which made `blaude --local` spend Claude tokens.
+    ANTHROPIC_MODEL: force ? `local/${cfg.defaultModel}` : cfg.defaultModel,
+    ANTHROPIC_SMALL_FAST_MODEL: force ? 'local/blaude-small' : 'blaude-small',
+    ANTHROPIC_DEFAULT_HAIKU_MODEL: force ? 'local/blaude-small' : 'blaude-small',
     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
     ...(window ? { CLAUDE_CODE_MAX_CONTEXT_TOKENS: String(window) } : {}),
   };
+}
+
+/** True when the local window is too small for Claude Code's compaction to help. */
+export function needsCompactionGuard(cfg) {
+  const maxContext = cfg.models[cfg.defaultModel]?.maxContext || 0;
+  return maxContext > 0 && maxContext < 64_000;
 }
 
 /**
@@ -213,9 +234,32 @@ async function meterFor(cfg) {
 // commands
 // ---------------------------------------------------------------------------
 
+/**
+ * Split launcher arguments into Blaude's own and everything else.
+ *
+ * Everything Blaude does not own must reach `claude` untouched. The generic flag
+ * parser used by the subcommands is wrong here: it swallowed `--output-format`,
+ * `--allowedTools` and friends, so `blaude -p --output-format json` silently ran
+ * without them. That produced unparseable output and, because `--allowedTools`
+ * never arrived, sessions carrying every tool including MCP — which is exactly
+ * the 50k-token prompt the local model was choking on.
+ */
+export function splitLauncherArgs(argv) {
+  const OURS = new Set(['--local', '--claude', '--cloud']);
+  const ours = {};
+  const passthrough = [];
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === '--') { passthrough.push(...argv.slice(i + 1)); break; }
+    if (OURS.has(a)) { ours[a.slice(2)] = true; continue; }
+    passthrough.push(a);
+  }
+  return { ours, passthrough };
+}
+
 /** Bare `blaude`: pick the destination for this whole session, then launch it. */
 export async function cmdLaunch(argv) {
-  const { flags, positional } = parseFlags(argv);
+  const { ours: flags, passthrough } = splitLauncherArgs(argv);
   const cfg = loadConfig();
   const { policy, meter } = await meterFor(cfg);
 
@@ -259,7 +303,7 @@ export async function cmdLaunch(argv) {
   note('');
 
   const env = { ...process.env };
-  const args = [...positional];
+  const args = [...passthrough];
 
   if (decision.destination === 'cloud') {
     // Native Claude session: no interception, so prompt caching stays intact.
@@ -268,8 +312,9 @@ export async function cmdLaunch(argv) {
     if (decision.model) args.unshift('--model', decision.model);
   } else {
     await ensureGateway(cfg);
-    Object.assign(env, localSessionEnv(cfg));
+    Object.assign(env, localSessionEnv(cfg, { force: Boolean(flags.local) }));
     args.unshift(...localSessionArgs(cfg));
+    if (flags.local) note(`  ${C.dim('--local pins every request to the local model (gateway cannot escalate)')}`);
   }
 
   const bin = process.env.BLAUDE_CLAUDE_BIN || 'claude';

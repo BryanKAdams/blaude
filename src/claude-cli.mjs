@@ -266,10 +266,19 @@ export async function escalateViaCLI(body, {
   let result = null;
   let reused = false;
 
-  if (existing && existing.sentMessages < messageCount) {
+  // Two shapes reach here. A relayed agent turn grows one message array, so the
+  // delta starts where we left off. A per-turn reviewer hands us a fresh
+  // single-message body each time, so the array restarts and the delta is just
+  // that last message. Keying only off "have we sent this many yet" broke the
+  // second shape, which then paid full price on a brand new session every time.
+  const deltaFrom = messageCount > existing?.sentMessages
+    ? existing.sentMessages
+    : Math.max(0, messageCount - 1);
+
+  if (existing) {
     try {
       result = await runClaudeCLI({
-        prompt: renderDelta(body, existing.sentMessages, { includeTools }),
+        prompt: renderDelta(body, deltaFrom, { includeTools }),
         model, appendSystemPrompt, cwd, timeoutMs, bin, env, lean,
         extraArgs: ['--resume', existing.sessionId],
       });
