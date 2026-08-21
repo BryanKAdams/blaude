@@ -189,22 +189,33 @@ async function armE(localArm) {
   };
 }
 
-async function armC() {
+async function armC(localArm = null) {
   const known = await sessionsBefore(Date.now() - 7 * 86_400_000);
   const t0 = Date.now();
-  // 1. the local model does the work
-  const local = await run('node', [BLAUDE, '--local', '-p', '--output-format', 'json', '--allowedTools', 'Read,Glob'], { input: TASK });
-  const localJson = result(local);
-  const localAnswer = localJson.result || local.out;
-  const tLocal = Date.now();
+  // 1. the local model does the work — or reuse a completed local run, so the
+  //    (slow) local pass is not paid for once per arm.
+  let localAnswer;
+  let tLocal;
+  if (localArm?.text) {
+    localAnswer = localArm.text;
+    tLocal = t0;
+  } else {
+    const local = await run('node', [BLAUDE, '--local', '-p', '--output-format', 'json', '--allowedTools', 'Read,Glob'], { input: TASK });
+    const localJson = result(local);
+    localAnswer = localJson.result || local.out;
+    tLocal = Date.now();
+  }
 
   // 2. Claude reviews that answer once
   const audit = await run('node', [BLAUDE, 'audit', '--force', '--model', process.env.BENCH_MODEL || 'sonnet',
     `${TASK}\n\nThe local model answered:\n${localAnswer}\n\nVerify the count yourself and give the corrected two lines.`]);
   const t1 = Date.now();
   return {
-    name: 'C local+audit', ms: t1 - t0, localMs: tLocal - t0,
-    text: audit.out, localText: localAnswer, turns: localJson.num_turns ?? null,
+    name: 'C local+audit',
+    ms: (localArm?.ms || 0) + (t1 - t0),
+    auditMs: t1 - tLocal,
+    text: audit.out, localText: localAnswer,
+    reusedLocal: Boolean(localArm?.text),
     spend: await claudeSpend(t0, t1, known),
   };
 }
@@ -220,7 +231,7 @@ const chosen = ORDER.filter(([k]) => WANT.includes(k));
 const arms = [];
 let localArm = null;
 for (const [key, fn] of chosen) {
-  const a = key === 'E' ? await fn(localArm) : await fn();
+  const a = (key === 'E' || key === 'C') ? await fn(localArm) : await fn();
   if (key === 'D') localArm = a;
   a.grade = grade(a.text);
   arms.push(a);
@@ -247,6 +258,9 @@ console.log('  what each arm actually replied:');
 for (const a of arms) {
   const oneLine = String(a.text || '').replace(/\s+/g, ' ').trim().slice(0, 150);
   console.log(`    ${a.name}: ${oneLine || '(empty)'}`);
+  if (a.auditMs != null) {
+    console.log(`      local pass: ${a.reusedLocal ? 'reused from arm D' : 'run fresh'} · audit itself took ${(a.auditMs / 1000).toFixed(1)}s`);
+  }
   if (a.verdicts) {
     for (const v of a.verdicts) {
       console.log(`      review turn ${v.turn} (${v.reused ? 'resumed' : 'new'} session): ${v.text}`);

@@ -19,7 +19,7 @@ import { resolveModel } from './router.mjs';
 import { readUsage, summarize } from './usage.mjs';
 import { escalateViaCLI, runClaudeCLI } from './claude-cli.mjs';
 import { simulate, loadHistory } from './simulate.mjs';
-import { detectOllama, loadedContexts, planContextChange, applyStep, waitForOllama, modelMemoryProfile, planMemory } from './ollama-admin.mjs';
+import { detectOllama, loadedContexts, planContextChange, applyStep, waitForOllama, modelMemoryProfile, planMemory, availableMemory } from './ollama-admin.mjs';
 import { listSessions, digestSession, appendNote, readNotes } from './handoff.mjs';
 import { readAccount, describeAccount, portForAccount } from './account.mjs';
 
@@ -1484,7 +1484,20 @@ export async function cmdOllama(argv) {
     profile = await modelMemoryProfile(backend.baseUrl, modelName);
     const tags = await fetch(`${backend.baseUrl.replace(/\/+$/, '')}/api/tags`, { signal: AbortSignal.timeout(8000) }).then((r) => r.json());
     weightsBytes = (tags.models || []).find((m) => m.name === modelName)?.size || 0;
-    memPlan = planMemory({ profile, tokens, weightsBytes, totalBytes: totalmem() });
+    const mem = availableMemory();
+    // The model being reconfigured is about to be unloaded, so its current
+    // residency counts as available — otherwise raising a context looks
+    // impossible purely because the old allocation is still held.
+    const resident = (await loadedContexts(backend.baseUrl).catch(() => []))
+      .filter((m) => m.name === modelName)
+      .reduce((n, m) => n + (m.sizeVram || 0), 0);
+    memPlan = planMemory({
+      profile, tokens, weightsBytes,
+      totalBytes: totalmem(),
+      availableBytes: mem.availableBytes + resident,
+    });
+    memPlan.mem = mem;
+    memPlan.reclaimable = resident;
   } catch (err) {
     out(`  ${C.yellow('!')} could not inspect ${modelName} (${err.message}) — proceeding without a memory check`);
   }
@@ -1506,6 +1519,11 @@ export async function cmdOllama(argv) {
   if (memPlan) {
     const perTok = profile.bytesPerTokenFp16 / 1024;
     out(`  ${C.dim(`${profile.layers} layers · ${profile.kvHeads} kv heads · ${perTok.toFixed(0)} KB/token at f16 · weights ${(weightsBytes / 1e9).toFixed(1)} GB`)}`);
+    out(`  ${C.dim(`memory available: ${(memPlan.headroom / 1e9).toFixed(1)} GB of ${(totalmem() / 1e9).toFixed(0)} GB total`
+      + (memPlan.reclaimable ? ` (includes ${(memPlan.reclaimable / 1e9).toFixed(1)} GB reclaimed from the current load)` : ''))}`);
+    if (memPlan.mem?.alreadySwapping) {
+      out(`  ${C.yellow('!')} this machine is already using ${(memPlan.mem.swapUsedBytes / 1e9).toFixed(1)} GB of swap — close things before allocating more`);
+    }
     out('');
     for (const o of memPlan.options) {
       const label = `KV ${o.type}`.padEnd(9);

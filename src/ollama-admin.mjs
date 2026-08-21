@@ -213,6 +213,29 @@ export async function modelMemoryProfile(baseUrl, model) {
 export const KV_TYPES = { f16: 1, q8_0: 2, q4_0: 4 };
 
 /**
+ * Memory actually available right now, not the size of the machine.
+ *
+ * Planning against total memory is how you end up swapping: this Mac has 52 GB
+ * but was already using ~15 GB for editors, browsers and other Claude Code
+ * sessions, so a "35 GB fits in 52 GB" plan pushed 11 GB into swap and the model
+ * failed to stay resident. Free plus inactive pages is what a new allocation can
+ * really draw on.
+ */
+export function availableMemory() {
+  const out = spawnSync('vm_stat', [], { encoding: 'utf8' }).stdout || '';
+  const pageSize = Number(/page size of (\d+)/.exec(out)?.[1] || 16384);
+  const pages = (label) => Number(new RegExp(`${label}:\\s+(\\d+)`).exec(out)?.[1] || 0);
+  const free = pages('Pages free') + pages('Pages inactive') + pages('Pages purgeable');
+  const swap = spawnSync('sysctl', ['-n', 'vm.swapusage'], { encoding: 'utf8' }).stdout || '';
+  const swapUsedMb = Number(/used = ([\d.]+)M/.exec(swap)?.[1] || 0);
+  return {
+    availableBytes: free * pageSize,
+    swapUsedBytes: swapUsedMb * 1e6,
+    alreadySwapping: swapUsedMb > 512,
+  };
+}
+
+/**
  * Work out which KV cache type (if any) makes `tokens` of context fit.
  *
  * `weightsBytes` is taken from the installed model size, and a slice of memory
@@ -220,14 +243,18 @@ export const KV_TYPES = { f16: 1, q8_0: 2, q4_0: 4 };
  * technically fits but leaves nothing for the system will swap, which is far
  * slower than a smaller context.
  */
-export function planMemory({ profile, tokens, weightsBytes, totalBytes, reserveBytes = 12e9 }) {
-  const budget = totalBytes - reserveBytes - weightsBytes;
+export function planMemory({ profile, tokens, weightsBytes, totalBytes, reserveBytes = 6e9, availableBytes = null }) {
+  // Plan against what is free now (minus a cushion for the rest of the system),
+  // falling back to total memory only when availability cannot be read.
+  const headroom = availableBytes != null ? availableBytes : totalBytes;
+  const budget = headroom - reserveBytes - weightsBytes;
   const options = Object.entries(KV_TYPES).map(([type, divisor]) => {
     const kvBytes = profile.bytesPerTokenFp16 ? (profile.bytesPerTokenFp16 * tokens) / divisor : null;
     return { type, kvBytes, totalBytes: kvBytes == null ? null : kvBytes + weightsBytes, fits: kvBytes != null && kvBytes <= budget };
   });
   return {
     budget,
+    headroom,
     options,
     exceedsModelMax: Boolean(profile.modelMaxContext && tokens > profile.modelMaxContext),
     recommended: options.find((o) => o.fits) || null,
