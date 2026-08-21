@@ -1,5 +1,6 @@
 // The Blaude gateway: an Anthropic-Messages-shaped front door over local models.
 import { createServer } from 'node:http';
+import { watch } from 'node:fs';
 import { performance } from 'node:perf_hooks';
 import { resolveModel, RouteError } from './router.mjs';
 import { anthropicToOpenAI, flattenSystem, TranslateError } from './anthropic-to-openai.mjs';
@@ -65,10 +66,54 @@ export function createGateway(cfg) {
   const log = makeLogger(cfg.logLevel);
   const started = Date.now();
   const counters = { requests: 0, streamed: 0, errors: 0, cloud: 0, escalated: 0 };
-  const policy = normalizePolicy(cfg.policy || {});
-  const meter = new AllowanceMeter({ policy });
-  const affinity = new TurnAffinity();
-  const ctx = { cfg, log, counters, policy, meter, affinity };
+  // Policy is held in a mutable box so a config change can take effect in a
+  // running session. Restarting the gateway to pick up `blaude mode` would drop
+  // every in-flight request and break any session pointed at it.
+  const state = {
+    policy: normalizePolicy(cfg.policy || {}),
+    meter: null,
+    affinity: new TurnAffinity(),
+  };
+  state.meter = new AllowanceMeter({ policy: state.policy });
+
+  function reloadConfig(reason) {
+    try {
+      const next = loadConfig();
+      const nextPolicy = normalizePolicy(next.policy || {});
+      const changed = JSON.stringify(nextPolicy) !== JSON.stringify(state.policy)
+        || next.defaultModel !== cfg.defaultModel;
+      if (!changed) return false;
+
+      Object.assign(cfg, next);
+      state.policy = nextPolicy;
+      // A fresh meter, because limits and unit may have moved with the policy.
+      state.meter = new AllowanceMeter({ policy: nextPolicy });
+      log.info(
+        `\x1b[36mconfig reloaded\x1b[0m (${reason}) — mode ${nextPolicy.mode}, ` +
+        `local ${next.defaultModel}, floors ` +
+        Object.entries(nextPolicy.floors).map(([k, v]) => `${k}=${v >= 1 ? 'local' : `${Math.round(v * 100)}%`}`).join(' '),
+      );
+      return true;
+    } catch (err) {
+      log.error(`config reload failed, keeping the previous policy: ${err.message}`);
+      return false;
+    }
+  }
+
+  // Watching the file means `blaude mode` / `blaude use` apply to a live session.
+  let watcher = null;
+  if (cfg.configSource && cfg.configSource !== '(defaults)') {
+    try {
+      let debounce = null;
+      watcher = watch(cfg.configSource, () => {
+        clearTimeout(debounce);
+        debounce = setTimeout(() => reloadConfig('file changed'), 150);
+      });
+      watcher.unref?.();
+    } catch { /* watching is a convenience, not a requirement */ }
+  }
+
+  const ctx = { cfg, log, counters, state };
 
   const server = createServer(async (req, res) => {
     const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
@@ -102,15 +147,17 @@ export function createGateway(cfg) {
       }
 
       if (req.method === 'GET' && path === '/blaude/status') {
-        await meter.refresh();
+        if (url.searchParams.get('reload')) reloadConfig('requested');
+        await state.meter.refresh();
         return sendJSON(res, 200, {
-          mode: policy.mode,
-          cloudTransport: policy.cloudTransport,
-          source: policy.source,
-          windows: meter.windows,
-          binding: meter.tightest(),
-          uncalibrated: meter.uncalibrated,
-          routing: explainPolicy(policy, meter),
+          mode: state.policy.mode,
+          cloudTransport: state.policy.cloudTransport,
+          source: state.policy.source,
+          windows: state.meter.windows,
+          binding: state.meter.tightest(),
+          uncalibrated: state.meter.uncalibrated,
+          routing: explainPolicy(state.policy, state.meter),
+          defaultModel: cfg.defaultModel,
           counters,
         });
       }
@@ -129,7 +176,7 @@ export function createGateway(cfg) {
         const raw = await readBody(req);
         let body;
         try { body = JSON.parse(raw); } catch { throw new TranslateError('Request body is not valid JSON'); }
-        return await handleMessages({ ...ctx, req, res, body, raw });
+        return await handleMessages({ ...ctx, policy: state.policy, meter: state.meter, affinity: state.affinity, req, res, body, raw });
       }
 
       return sendError(res, 404, 'not_found_error', `Blaude has no route for ${req.method} ${path}`);
@@ -142,7 +189,8 @@ export function createGateway(cfg) {
   });
 
   server.keepAliveTimeout = 120_000;
-  server.blaude = { policy, meter, counters, cfg };
+  server.blaude = { state, counters, cfg, reloadConfig };
+  server.on('close', () => watcher?.close?.());
   server.headersTimeout = 130_000;
   server.requestTimeout = 0; // long local generations must not be cut off
   return { server, log, counters };
@@ -630,7 +678,7 @@ export function startGateway(cfg) {
   return new Promise((resolve, reject) => {
     server.once('error', reject);
     server.listen(cfg.port, cfg.host, async () => {
-      const { policy, meter } = server.blaude;
+      const { policy, meter } = server.blaude.state;
       await meter.refresh().catch(() => {});
       const tight = meter.tightest();
       log.plain('');

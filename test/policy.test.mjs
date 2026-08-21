@@ -54,8 +54,8 @@ test('invalid policies are rejected with a useful message', () => {
   assert.throws(() => normalizePolicy({ source: 'vibes' }), /Unknown source/);
 });
 
-test('local-first keeps work local and lets audits reach Claude', () => {
-  const policy = normalizePolicy({ mode: 'local-first' });
+test('claude-audits keeps work local and lets audits reach Claude', () => {
+  const policy = normalizePolicy({ mode: 'claude-audits' });
   const meter = fakeMeter(0.8);
   assert.equal(decide({ policy, meter, body: freshTurn, requestedModel: 'claude-sonnet-5' }).destination, 'local');
   assert.equal(decide({ policy, meter, body: freshTurn, requestedModel: 'audit/opus' }).destination, 'cloud');
@@ -142,7 +142,7 @@ test('the hard stop breaks turn affinity to protect the remainder', () => {
 test('capability routing reaches Claude even when the purpose floor says never', () => {
   // local-first keeps `main` local, but a request the local model cannot serve
   // at all is a different question: it escalates on its own bounded floor.
-  const policy = normalizePolicy({ mode: 'local-first', capabilityRouting: { toolsRequireClaude: true } });
+  const policy = normalizePolicy({ mode: 'claude-audits', capabilityRouting: { toolsRequireClaude: true } });
   const body = { ...freshTurn, tools: [{ name: 'Read', input_schema: {} }] };
   const d = decide({ policy, meter: fakeMeter(0.5), body, requestedModel: 'm', localCapabilities: { tools: false } });
   assert.equal(d.destination, 'cloud');
@@ -150,7 +150,7 @@ test('capability routing reaches Claude even when the purpose floor says never',
 });
 
 test('capability escalation is bounded by its own floor and off in local-only', () => {
-  const policy = normalizePolicy({ mode: 'local-first', capabilityRouting: { toolsRequireClaude: true, floor: 0.05 } });
+  const policy = normalizePolicy({ mode: 'claude-audits', capabilityRouting: { toolsRequireClaude: true, floor: 0.05 } });
   const body = { ...freshTurn, tools: [{ name: 'Read', input_schema: {} }] };
   const broke = decide({ policy, meter: fakeMeter(0.02), body, requestedModel: 'm', localCapabilities: { tools: false } });
   assert.equal(broke.destination, 'local', 'must not drain the last of the allowance');
@@ -208,4 +208,10 @@ test('a genuine prompt is not mistaken for a command', () => {
   }
   assert.equal(nearestCommand('"quoted text"'), null);
   assert.equal(nearestCommand(''), null);
+});
+
+test('the old mode name still resolves, so existing configs keep working', () => {
+  const legacy = normalizePolicy({ mode: 'local-first' });
+  assert.equal(legacy.mode, 'claude-audits');
+  assert.deepEqual(legacy.floors, normalizePolicy({ mode: 'claude-audits' }).floors);
 });

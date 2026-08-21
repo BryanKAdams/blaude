@@ -5,8 +5,8 @@ import { join } from 'node:path';
 import { loadConfig, BLAUDE_HOME, ensureHome, DEFAULTS } from './config.mjs';
 import { startGateway } from './server.mjs';
 import {
-  normalizePolicy, AllowanceMeter, decide, explainPolicy, MODES, PURPOSES,
-  pct, fmt, NEVER, PERIOD_MS,
+  normalizePolicy, AllowanceMeter, decide, explainPolicy, MODES, MODE_ALIASES,
+  resolveModeName, PURPOSES, pct, fmt, NEVER, PERIOD_MS,
 } from './policy.mjs';
 import {
   claudeUsageReport, readClaudeEvents, peakWindow, DEFAULT_WEIGHTS,
@@ -142,6 +142,41 @@ export function localSessionEnv(cfg) {
     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
     ...(window ? { CLAUDE_CODE_MAX_CONTEXT_TOKENS: String(window) } : {}),
   };
+}
+
+/**
+ * Gate an out-of-band Claude call on the same floor the gateway would apply.
+ *
+ * `blaude audit` and `blaude search` reach Claude directly through the CLI, so
+ * they bypass the gateway entirely. Without this they would spend allowance (or
+ * credits) no matter what the policy says — which defeats the point of having a
+ * policy. The floor for the purpose applies, and `--force` is the deliberate
+ * override.
+ */
+async function assertAllowance(purpose, { force = false, label = purpose } = {}) {
+  const cfg = loadConfig();
+  const { policy, meter } = await meterFor(cfg);
+  const floor = policy.floors?.[purpose] ?? NEVER;
+  const tight = meter.tightestFor(policy.cloudModels?.[purpose]);
+
+  if (force) {
+    if (tight) out(C.dim(`  (--force: proceeding with ${pct(tight.fractionRemaining)} of ${tight.name} allowance left)`));
+    return { policy, meter, tight };
+  }
+  if (!tight) return { policy, meter, tight };
+
+  const blocked = floor >= NEVER || tight.fractionRemaining <= floor;
+  if (blocked) {
+    const why = floor >= NEVER
+      ? `mode "${policy.mode}" keeps ${purpose} local`
+      : `${pct(tight.fractionRemaining)} of your ${tight.name} allowance is left, at or below the ${pct(floor)} floor for ${purpose}`;
+    throw new Error(
+      `${label} would spend Claude, but ${why}.\n` +
+      `  ${tight.resetsAt ? `Allowance resets ${tight.resetsAt}.\n  ` : ''}` +
+      `Override with --force, or lower the floor: blaude mode ${policy.mode} --floor ${purpose}=1`,
+    );
+  }
+  return { policy, meter, tight };
 }
 
 async function meterFor(cfg) {
@@ -562,7 +597,7 @@ export async function cmdUsage(argv) {
 
 export async function cmdMode(argv) {
   const { flags, positional } = parseFlags(argv);
-  const mode = positional[0];
+  const mode = positional[0] ? resolveModeName(positional[0]) : positional[0];
   if (!mode) {
     const cfg = loadConfig();
     const current = normalizePolicy(cfg.policy || {});
@@ -572,6 +607,10 @@ export async function cmdMode(argv) {
     for (const [name, m] of Object.entries(MODES)) {
       out(`  ${name === current.mode ? C.green('●') : C.dim('○')} ${C.bold(name.padEnd(14))} ${m.description}`);
       out(`    ${C.dim(PURPOSES.map((p) => `${p}:${m.floors[p] >= NEVER ? 'local' : pct(m.floors[p])}`).join('  '))}`);
+    }
+    out('');
+    for (const [alias, target] of Object.entries(MODE_ALIASES)) {
+      out(`  ${C.dim(`("${alias}" still works — it now means ${target})`)}`);
     }
     out('');
     out(`  ${C.dim('blaude mode claude-first --floor 20%      use Claude until 20% of allowance remains')}`);
@@ -743,6 +782,7 @@ export async function cmdAudit(argv) {
   const policy = normalizePolicy(cfg.policy || {});
   const model = flags.model || policy.cloudModels.audit || 'opus';
   const cwd = flags.cwd || process.cwd();
+  const { tight } = await assertAllowance('audit', { force: Boolean(flags.force), label: 'An audit' });
 
   const git = (args) => spawnSync('git', args, { cwd, encoding: 'utf8' }).stdout?.trim() || '';
   const isRepo = spawnSync('git', ['rev-parse', '--is-inside-work-tree'], { cwd, encoding: 'utf8' }).status === 0;
@@ -782,6 +822,7 @@ export async function cmdAudit(argv) {
 
   out('');
   out(`  ${C.bold('Audit')} ${C.dim(`-> Claude ${model} (subscription, via CLI)`)}`);
+  if (tight) out(`  ${C.dim(`${pct(tight.fractionRemaining)} of ${tight.name} allowance left`)}`);
   out(`  ${C.dim(`${brief.length.toLocaleString()} chars of context from ${cwd}`)}`);
   out('');
 
@@ -1232,6 +1273,7 @@ export async function cmdSearch(argv) {
   if (!query) throw new Error('usage: blaude search "what you want to know"');
 
   const model = flags.model || policy.cloudModels.tools || 'haiku';
+  await assertAllowance('tools', { force: Boolean(flags.force), label: 'A web search' });
   const t0 = Date.now();
   const result = await runClaudeCLI({
     prompt:

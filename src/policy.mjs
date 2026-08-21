@@ -39,11 +39,14 @@ export const NEVER = 1;
 
 export const MODES = {
   'local-only': {
-    description: 'Everything local. Claude only via an explicit cloud/ prefix.',
+    description: 'Everything local, always. Claude is unreachable, even for audits.',
     floors: { main: NEVER, tools: NEVER, audit: NEVER, background: NEVER },
   },
-  'local-first': {
-    description: 'Local model does the work; Claude reviews it.',
+  // Named for what Claude's job is, because the old name ("local-first") read as
+  // "prefer local, fall back to Claude automatically", which is not what it does:
+  // every turn is local, and Claude is reachable only for review.
+  'claude-audits': {
+    description: 'Local does all the work; Claude is only used to review it.',
     floors: { main: NEVER, tools: NEVER, audit: 0.05, background: NEVER },
   },
   'claude-first': {
@@ -56,8 +59,17 @@ export const MODES = {
   },
 };
 
+/** Old names kept working, so existing configs do not break. */
+export const MODE_ALIASES = {
+  'local-first': 'claude-audits',
+};
+
+export function resolveModeName(name) {
+  return MODE_ALIASES[name] || name;
+}
+
 export const DEFAULT_POLICY = {
-  mode: 'local-first',
+  mode: 'claude-audits',
 
   // Allotments per window. `amount` 0 means "unknown" -> that window is ignored
   // until you run `blaude calibrate`.
@@ -156,8 +168,14 @@ export function normalizePolicy(input = {}) {
   };
   policy.weights = { ...DEFAULT_WEIGHTS, ...(input.weights || {}) };
 
+  policy.mode = resolveModeName(policy.mode);
   const mode = MODES[policy.mode];
-  if (!mode) throw new Error(`Unknown Blaude mode "${policy.mode}". Known: ${Object.keys(MODES).join(', ')}`);
+  if (!mode) {
+    throw new Error(
+      `Unknown Blaude mode "${policy.mode}". Known: ${Object.keys(MODES).join(', ')}` +
+      ` (aliases: ${Object.keys(MODE_ALIASES).join(', ')})`,
+    );
+  }
 
   const floors = { ...mode.floors, ...(input.floors || {}) };
   for (const [purpose, value] of Object.entries(floors)) {
