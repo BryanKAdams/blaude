@@ -93,8 +93,11 @@ export function selectTools(tools, { mode = 'core', allow = CORE_TOOLS, also = [
 /** One-line summary for the log, or null when nothing was dropped. */
 export function describeToolSelection(report) {
   if (!report.dropped.length) return null;
-  return `${report.dropped.length} tools dropped (~${report.savedTokens.toLocaleString()} tok saved), `
-    + `${report.keptCount} kept: ${report.dropped.slice(0, 8).join(', ')}`
+  // The list is of what went, so say so: labelling it "kept" read as though the
+  // tools named had survived, which is the opposite of what happened.
+  return `${report.dropped.length} dropped, ${report.keptCount} kept `
+    + `(~${report.savedTokens.toLocaleString()} tok saved) — dropped: `
+    + report.dropped.slice(0, 8).join(', ')
     + (report.dropped.length > 8 ? `, +${report.dropped.length - 8} more` : '');
 }
 
