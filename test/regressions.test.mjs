@@ -294,3 +294,42 @@ test('--version reports what package.json says, not a literal', async () => {
 
   assert.equal(printed, `blaude ${pkg.version}`);
 });
+
+test('a tool the conversation already used is never dropped', async () => {
+  // The model has seen it work and will reach for it again. A tool_use naming
+  // something absent from the request dies as "No such tool available", losing
+  // the turn — which is worse than the tokens the definition costs.
+  const { selectTools, toolsUsedInHistory } = await import('../src/fit-context.mjs');
+
+  const tools = [
+    { name: 'Read', description: 'read' },
+    { name: 'Workflow', description: 'W'.repeat(20000) },
+    { name: 'DesignSync', description: 'D'.repeat(8000) },
+  ];
+  const messages = [
+    { role: 'user', content: 'fix it' },
+    { role: 'assistant', content: [{ type: 'tool_use', id: 't1', name: 'DesignSync', input: {} }] },
+    { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't1', content: 'done' }] },
+  ];
+
+  assert.deepEqual(toolsUsedInHistory(messages), ['DesignSync']);
+
+  const { tools: kept, report } = selectTools(tools, { mode: 'core', keepUsed: toolsUsedInHistory(messages) });
+  const names = kept.map((t) => t.name);
+  assert.ok(names.includes('DesignSync'), 'the used tool survives even though it is not in the core set');
+  assert.ok(names.includes('Read'), 'the core set still applies');
+  assert.deepEqual(report.dropped, ['Workflow'], 'untouched non-core tools still go');
+});
+
+test('the trim log names the tools that survived, not the ones that went', async () => {
+  const { selectTools, describeToolSelection } = await import('../src/fit-context.mjs');
+  const tools = [
+    { name: 'Read', description: 'read' },
+    { name: 'Workflow', description: 'W'.repeat(20000) },
+  ];
+  const line = describeToolSelection(selectTools(tools, { mode: 'core' }).report);
+  // "which tools does the model actually have" is the question you are asking
+  // when a turn dies on a missing tool; the dropped list elides exactly then.
+  assert.match(line, /kept: Read/);
+  assert.doesNotMatch(line, /kept: Workflow/);
+});

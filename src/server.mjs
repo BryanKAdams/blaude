@@ -17,7 +17,7 @@ import {
 import { escalateViaCLI } from './claude-cli.mjs';
 import { cachedCapability, capabilityKey } from './capabilities.mjs';
 import { syntheticSSE } from './stream.mjs';
-import { fitToContext, describeFit, selectTools, describeToolSelection } from './fit-context.mjs';
+import { fitToContext, describeFit, selectTools, describeToolSelection, toolsUsedInHistory } from './fit-context.mjs';
 import { toOllamaRequest, fromOllamaResponse, fromOllamaChunk, newOllamaStreamCursor, NDJSONParser } from './ollama-backend.mjs';
 import { residentContext } from './ollama-admin.mjs';
 
@@ -308,7 +308,10 @@ async function handleMessages({ cfg, log, counters, policy, meter, affinity, req
   // Shed tool definitions the local model will never call, before anything is
   // measured against the window — they are 78% of Claude Code's fixed floor.
   if (localBody.tools?.length) {
-    const { tools: kept, report } = selectTools(localBody.tools, cfg.localTools || {});
+    const { tools: kept, report } = selectTools(localBody.tools, {
+      ...(cfg.localTools || {}),
+      keepUsed: toolsUsedInHistory(localBody.messages),
+    });
     if (report.dropped.length) {
       localBody = { ...localBody, tools: kept };
       log.info(`tool trim for ${route.target}: ${describeToolSelection(report)}`);

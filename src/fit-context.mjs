@@ -67,15 +67,30 @@ export const CORE_TOOLS = [
  *
  * @returns {{tools:Array|undefined, report:{dropped:string[], keptCount:number, savedTokens:number}}}
  */
-export function selectTools(tools, { mode = 'core', allow = CORE_TOOLS, also = [] } = {}) {
-  const report = { dropped: [], keptCount: Array.isArray(tools) ? tools.length : 0, savedTokens: 0 };
+export function toolsUsedInHistory(messages = []) {
+  const used = new Set();
+  for (const m of messages) {
+    const blocks = typeof m?.content === 'string' ? [] : (m?.content || []);
+    for (const b of blocks) {
+      if (b?.type === 'tool_use' && b.name) used.add(b.name);
+    }
+  }
+  return [...used];
+}
+
+export function selectTools(tools, { mode = 'core', allow = CORE_TOOLS, also = [], keepUsed = [] } = {}) {
+  const report = { dropped: [], kept: [], keptCount: Array.isArray(tools) ? tools.length : 0, savedTokens: 0 };
   if (mode === 'all' || !Array.isArray(tools) || !tools.length) return { tools, report };
 
-  const patterns = [...allow, ...also];
+  // A tool the conversation has already called is never dropped. The model has
+  // seen it work and will reach for it again — and a tool_use naming something
+  // absent from the request fails as "No such tool available", losing the turn.
+  // Dropping definitions is only safe for tools nothing has touched yet.
+  const patterns = [...allow, ...also, ...keepUsed];
   const keep = [];
   for (const t of tools) {
     const name = t?.name || t?.function?.name || '';
-    if (patterns.some((p) => globMatch(p, name))) keep.push(t);
+    if (patterns.some((p) => globMatch(p, name))) { keep.push(t); report.kept.push(name || '(unnamed)'); }
     else {
       report.dropped.push(name || '(unnamed)');
       report.savedTokens += estimateTokens(t);
@@ -84,7 +99,7 @@ export function selectTools(tools, { mode = 'core', allow = CORE_TOOLS, also = [
   // Never hand back an empty tool array: a coding agent with no tools is worse
   // than a slow one, and an allowlist that matches nothing is a misconfiguration
   // rather than an instruction to disarm the session.
-  if (!keep.length) return { tools, report: { dropped: [], keptCount: tools.length, savedTokens: 0 } };
+  if (!keep.length) return { tools, report: { dropped: [], kept: [], keptCount: tools.length, savedTokens: 0 } };
 
   report.keptCount = keep.length;
   return { tools: keep, report };
@@ -95,10 +110,11 @@ export function describeToolSelection(report) {
   if (!report.dropped.length) return null;
   // The list is of what went, so say so: labelling it "kept" read as though the
   // tools named had survived, which is the opposite of what happened.
+  // Name what SURVIVED. The dropped list is the long one and gets elided exactly
+  // when it matters; "which tools does the model actually have" is the question
+  // you are asking when a turn dies on a missing tool.
   return `${report.dropped.length} dropped, ${report.keptCount} kept `
-    + `(~${report.savedTokens.toLocaleString()} tok saved) — dropped: `
-    + report.dropped.slice(0, 8).join(', ')
-    + (report.dropped.length > 8 ? `, +${report.dropped.length - 8} more` : '');
+    + `(~${report.savedTokens.toLocaleString()} tok saved) — kept: ${report.kept.join(', ')}`;
 }
 
 /**
