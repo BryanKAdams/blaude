@@ -30,8 +30,22 @@ die()  { printf '\033[31m✗\033[0m %s\n' "$1" >&2; exit 1; }
 command -v gh >/dev/null 2>&1 || die "the GitHub CLI is required: brew install gh"
 gh auth status >/dev/null 2>&1 || die "run: gh auth login"
 
+# The tree is checked BEFORE the bump, not after. Bumping first makes the tree
+# dirty by definition, so the check below would reject every release that used
+# the documented `release.sh <version>` form — the bump was its own tripwire.
+if [ -n "$(git status --porcelain)" ] && [ "$DRY_RUN" -eq 0 ]; then
+  die "working tree is dirty. Commit first — the tag has to point at what you shipped."
+fi
+
 if [ -n "$BUMP" ]; then
   [[ "$BUMP" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || die "\"$BUMP\" is not a semver version"
+  # A dry run must leave the repo exactly as it found it, so the bump it needs
+  # in order to build and verify a tarball is put back on the way out.
+  if [ "$DRY_RUN" -eq 1 ]; then
+    RESTORE_PKG="$(mktemp)"
+    cp package.json "$RESTORE_PKG"
+    trap 'cp "$RESTORE_PKG" package.json 2>/dev/null; rm -f "$RESTORE_PKG"' EXIT
+  fi
   node -e '
     const fs = require("fs");
     const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
@@ -45,9 +59,6 @@ VERSION="$(node -p 'require("./package.json").version')"
 TAG="v$VERSION"
 bold "Releasing blaude $VERSION"
 
-if [ -n "$(git status --porcelain)" ] && [ "$DRY_RUN" -eq 0 ]; then
-  die "working tree is dirty. Commit first — the tag has to point at what you shipped."
-fi
 if [ "$DRY_RUN" -eq 0 ] && git rev-parse "$TAG" >/dev/null 2>&1; then
   die "$TAG already exists. Bump the version: scripts/release.sh <next>"
 fi
@@ -59,7 +70,9 @@ npm test >/dev/null || die "tests failed — not releasing"
 ok "tests pass"
 
 STAGE="$(mktemp -d)"
-trap 'rm -rf "$STAGE"' EXIT
+# Chained, not replaced: overwriting the trap here would drop the package.json
+# restore a dry run installed above.
+trap 'rm -rf "$STAGE"; [ -n "${RESTORE_PKG:-}" ] && { cp "$RESTORE_PKG" package.json 2>/dev/null; rm -f "$RESTORE_PKG"; }' EXIT
 PKGDIR="$STAGE/blaude-$VERSION"
 mkdir -p "$PKGDIR"
 for item in bin src blaude.config.example.json README.md package.json LICENSE install.sh; do
@@ -110,6 +123,16 @@ PREV_TAG="$(git tag --sort=-v:refname | head -1)"
   echo
   echo 'Already installed? `blaude update`'
 } > "$NOTES_FILE"
+
+# The tag has to point at a commit whose package.json says $VERSION: that file
+# is the only thing `blaude update` reads to decide what is installed, so a tag
+# on an un-bumped tree ships a tarball claiming a version its own source denies.
+if [ -n "$BUMP" ]; then
+  git add package.json
+  git commit -q -m "Release $VERSION"
+  git push origin HEAD
+  ok "committed and pushed the version bump"
+fi
 
 git tag -a "$TAG" -m "blaude $VERSION"
 git push origin "$TAG"

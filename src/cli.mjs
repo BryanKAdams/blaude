@@ -1971,7 +1971,11 @@ export function nearestCommand(word, names = Object.keys(COMMANDS)) {
 export async function main(argv = process.argv.slice(2)) {
   const [first, ...rest] = argv;
   if (first === '--help' || first === '-h' || first === 'help') return cmdHelp();
-  if (first === '--version' || first === '-v') return out('blaude 0.1.0');
+  // Read, never spelled out: a literal here is what version.mjs exists to stop.
+  // It survived that consolidation and quietly reported 0.1.0 forever, which
+  // also meant release.sh's "does the tarball report its version" gate could
+  // never pass for any release after the first.
+  if (first === '--version' || first === '-v') return out(`blaude ${VERSION}`);
 
   // Every command below reads `loadConfig()`, and the port it returns decides
   // which gateway this terminal talks to. `hook` is excluded because it runs

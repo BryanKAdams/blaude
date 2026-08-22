@@ -275,3 +275,22 @@ test('tool descriptions are given up one at a time, not all at once', () => {
   assert.ok(report.budget - report.after < 2000, 'no large slice of the budget is left unused');
   assert.equal(report.trimmedSystem, false, 'the system prompt is never reached');
 });
+
+test('--version reports what package.json says, not a literal', async () => {
+  // A hardcoded 'blaude 0.1.0' survived the consolidation into version.mjs and
+  // reported that string forever — so `blaude --version` lied after any update,
+  // and release.sh's "does the tarball report its version" gate could never pass
+  // for a release after the first.
+  const { readFileSync } = await import('node:fs');
+  const { execFileSync } = await import('node:child_process');
+  const { join, dirname } = await import('node:path');
+  const { fileURLToPath } = await import('node:url');
+
+  const root = dirname(dirname(fileURLToPath(import.meta.url)));
+  const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
+  const printed = execFileSync(process.execPath, [join(root, 'bin', 'blaude.mjs'), '--version'], {
+    encoding: 'utf8',
+  }).trim();
+
+  assert.equal(printed, `blaude ${pkg.version}`);
+});
