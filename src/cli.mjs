@@ -22,6 +22,11 @@ import { simulate, loadHistory } from './simulate.mjs';
 import { detectOllama, loadedContexts, planContextChange, applyStep, waitForOllama, modelMemoryProfile, planMemory, availableMemory } from './ollama-admin.mjs';
 import { listSessions, digestSession, appendNote, readNotes } from './handoff.mjs';
 import { readAccount, cachedAccount, describeAccount, portForAccount } from './account.mjs';
+import {
+  checkForUpdate, fetchLatestRelease, applyUpdate, rollback, describeInstall,
+  installedVersions, currentTarget, updateRepo, writeUpdateCache,
+} from './update.mjs';
+import { VERSION } from './version.mjs';
 
 const C = {
   bold: (s) => `\x1b[1m${s}\x1b[0m`,
@@ -1802,6 +1807,7 @@ export function cmdHelp() {
   ${C.bold('blaude route')} [auto|gateway] whether Blaude stays in the request path
   ${C.bold('blaude guard')} [on|off]       stop native Claude sessions at your floor
   ${C.bold('blaude remote')} [url]        use an Ollama on another machine ${C.dim('(--model X)')}
+  ${C.bold('blaude update')}               install the latest release ${C.dim('(--check, --rollback)')}
   ${C.bold('blaude search')} "query"      real web search for a local model, via Claude
   ${C.bold('blaude serve')}              run the gateway in the foreground
   ${C.bold('blaude simulate')}           try policies against your real history ${C.dim('(--days 7 --verbose)')}
@@ -1811,6 +1817,94 @@ export function cmdHelp() {
   ${C.dim('modes:')} ${Object.keys(MODES).join(', ')}
   ${C.dim('config:')} ${CONFIG_FILE()}
 `);
+}
+
+
+/**
+ * Install a newer Blaude, or step back to the one that worked.
+ *
+ * The install kind decides what is even safe to do. A release tree under
+ * ~/.blaude/versions is ours to swap; a git checkout may hold your uncommitted
+ * work, so it is never overwritten and the answer is always "git pull". Nothing
+ * installs without being asked for: `--check` only reports, and the background
+ * refresh that keeps the cache warm touches nothing but the cache.
+ */
+export async function cmdUpdate(argv) {
+  const { flags, positional } = parseFlags(argv);
+  const cfg = await loadConfig();
+  const repo = updateRepo(cfg);
+
+  // The detached refresh spawned by checkForUpdate({block:false}) lands here.
+  // It exists to warm the cache and must stay silent.
+  if (flags['refresh-cache']) {
+    const { release } = await fetchLatestRelease({ repo }).catch(() => ({ release: null }));
+    writeUpdateCache({ repo, latest: release?.version ?? null, tag: release?.tag ?? null, notes: release?.notes ?? '' });
+    return;
+  }
+
+  if (flags.rollback) {
+    const to = typeof flags.rollback === 'string' ? flags.rollback : (positional[0] || null);
+    try {
+      const { version, from } = rollback(to);
+      out(`${C.green('✓')} rolled back to ${C.bold(version)}${from ? C.dim(` (from ${from})`) : ''}`);
+    } catch (err) {
+      out(`${C.red('✗')} ${err.message}`);
+      process.exitCode = 1;
+    }
+    return;
+  }
+
+  const install = describeInstall();
+  out('');
+  out(`  ${C.bold('blaude')} ${VERSION}  ${C.dim(`(${install.kind} install at ${install.root})`)}`);
+
+  const status = await checkForUpdate({ repo }).catch((err) => ({ error: err.message }));
+  if (status?.error) {
+    out(`  ${C.red('✗')} could not reach ${repo}: ${status.error}`);
+    out('');
+    process.exitCode = 1;
+    return;
+  }
+  if (!status?.latest) {
+    out(`  ${C.dim(`no releases published on ${repo} yet`)}`);
+    out('');
+    return;
+  }
+  if (!status.newer) {
+    out(`  ${C.green('✓')} already on the latest release ${C.dim(`(${status.latest})`)}`);
+    const have = installedVersions();
+    if (have.length > 1) out(`  ${C.dim(`installed: ${have.join(', ')}`)}`);
+    out('');
+    return;
+  }
+
+  out(`  ${C.yellow('→')} ${C.bold(status.latest)} is available ${C.dim(`(you have ${status.current})`)}`);
+  if (flags.check) { out(''); return; }
+
+  // A checkout is the user's own working tree; overwriting it would destroy
+  // uncommitted work, so say what to run and stop.
+  if (install.kind === 'git') {
+    out(`  ${C.dim('this is a git checkout — update it with:')}  git -C ${install.root} pull`);
+    out('');
+    return;
+  }
+  if (install.kind !== 'release') {
+    out(`  ${C.dim('this copy is not managed by blaude (npm link, or copied by hand);')}`);
+    out(`  ${C.dim('reinstall with:')}  curl -fsSL https://raw.githubusercontent.com/${repo}/main/install.sh | sh`);
+    out('');
+    return;
+  }
+
+  const { release } = await fetchLatestRelease({ repo });
+  try {
+    await applyUpdate({ repo, release, onStep: (m) => out(`  ${C.dim(m)}`) });
+    out(`  ${C.green('✓')} updated to ${C.bold(release.version)} ${C.dim('— blaude update --rollback undoes this')}`);
+  } catch (err) {
+    out(`  ${C.red('✗')} update failed: ${err.message}`);
+    out(`  ${C.dim('your existing install was left untouched')}`);
+    process.exitCode = 1;
+  }
+  out('');
 }
 
 const COMMANDS = {
@@ -1833,6 +1927,7 @@ const COMMANDS = {
   guard: cmdGuard,
   route: cmdRoute,
   use: cmdUse,
+  update: cmdUpdate,
   'refresh-usage': cmdRefreshUsage,
   note: cmdNote,
   help: async () => cmdHelp(),
