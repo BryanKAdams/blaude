@@ -6,3 +6,6 @@ node_modules/
 # Nothing here should ever hold credentials.
 blaude.config.json
 .DS_Store
+
+# Release artifacts, built by scripts/release.sh
+dist/

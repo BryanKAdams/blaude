@@ -53,6 +53,37 @@ export const DEFAULTS = {
   // Emitted only when the upstream server does not report usage itself.
   estimateUsage: true,
 
+  // Ask Claude Code for its abbreviated system prompt and tool descriptions when
+  // the session is running locally. Measured: the fixed floor drops from 34,817
+  // tokens to 23,736 on its own, and to 5,399 combined with `localTools`.
+  simpleSystemPrompt: true,
+
+  // Which tool definitions reach a local model.
+  //
+  // Claude Code sends ~27,500 tokens of tool definitions across 25 tools; the
+  // largest are orchestration tools (Workflow alone is ~5,900) that a local
+  // coding model never calls, and every one of them is re-prefilled on every
+  // turn. Keeping only the coding core cuts the fixed floor by roughly 20k.
+  //
+  //   mode: 'core' -> keep `allow` (plus `also`);  'all' -> send everything
+  //   also: extra names or globs to keep, e.g. ['mcp__github__*']
+  localTools: { mode: 'core', also: [] },
+
+  // How many times to reissue a request that came back with nothing in it —
+  // no text and no tool calls. Some local builds do this intermittently
+  // (gemma4 on Ollama's MLX runner: 7 turns in 10 after a tool result), and the
+  // agent reads the empty turn as a finished one and stops. Set 0 to disable.
+  emptyCompletionRetries: 2,
+
+  // How long Claude Code waits on a single request before giving up.
+  //
+  // Its own default is minutes, which is fine against Claude and far too short
+  // against a large local model: prefill on a 27B runs at ~100 tok/s, so a 30k
+  // prompt needs ~5 minutes before the first token. The client timing out mid
+  // prefill is invisible from its side and looks like a hang, while the backend
+  // keeps grinding and blocks every other request queued behind it.
+  apiTimeoutMs: 900_000,
+
   // How `blaude` launches a session.
   //
   //   auto    -> when policy says Claude, launch a NATIVE Claude session (no

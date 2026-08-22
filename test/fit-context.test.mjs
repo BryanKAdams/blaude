@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { fitToContext, describeFit } from '../src/fit-context.mjs';
+import { fitToContext, describeFit, selectTools, CORE_TOOLS } from '../src/fit-context.mjs';
 
 /** A long agent session: big system prompt, many tools, fat tool outputs. */
 function bigSession({ turns = 10 } = {}) {
@@ -78,4 +78,62 @@ test('a brutal limit still yields a structurally valid request', () => {
   assert.equal(orphanCount(body), 0);
   assert.ok(body.messages.length >= 1, 'must not empty the conversation');
   assert.ok(report.trimmedSystem || report.trimmedTools || report.droppedMessages);
+});
+
+// ---------------------------------------------------------------------------
+// Tool selection
+// ---------------------------------------------------------------------------
+
+const claudeCodeTools = () => [
+  { name: 'Read', description: 'read a file' },
+  { name: 'Edit', description: 'edit a file' },
+  { name: 'Bash', description: 'run a command' },
+  { name: 'Skill', description: 'run a slash command' },
+  { name: 'Workflow', description: 'W'.repeat(20000) },
+  { name: 'DesignSync', description: 'D'.repeat(8000) },
+  { name: 'Agent', description: 'A'.repeat(8000) },
+  { name: 'mcp__github__create_pr', description: 'open a pull request' },
+];
+
+test('orchestration tools are dropped and the coding core is kept', () => {
+  const { tools, report } = selectTools(claudeCodeTools(), { mode: 'core' });
+  const names = tools.map((t) => t.name);
+  assert.ok(names.includes('Read') && names.includes('Edit') && names.includes('Bash'));
+  assert.deepEqual(report.dropped.sort(), ['Agent', 'DesignSync', 'Workflow', 'mcp__github__create_pr'].sort());
+  assert.ok(report.savedTokens > 8000, `saved a real amount (${report.savedTokens})`);
+});
+
+test('Skill survives, because dropping it breaks every slash command', () => {
+  // Blaude ships /bhandoff, /claudit and /bstatus; they run through Skill.
+  const { tools } = selectTools(claudeCodeTools(), { mode: 'core' });
+  assert.ok(tools.some((t) => t.name === 'Skill'));
+  assert.ok(CORE_TOOLS.includes('ToolSearch'), 'deferred tools stay reachable too');
+});
+
+test('`also` keeps extra tools by glob, and mode "all" disables the filter', () => {
+  const kept = selectTools(claudeCodeTools(), { mode: 'core', also: ['mcp__github__*'] }).tools;
+  assert.ok(kept.some((t) => t.name === 'mcp__github__create_pr'));
+
+  const untouched = selectTools(claudeCodeTools(), { mode: 'all' });
+  assert.equal(untouched.tools.length, 8);
+  assert.equal(untouched.report.dropped.length, 0);
+});
+
+test('an allowlist that matches nothing is treated as misconfiguration, not disarmament', () => {
+  // A coding agent with zero tools is worse than a slow one.
+  const { tools, report } = selectTools(claudeCodeTools(), { mode: 'core', allow: ['NoSuchTool'] });
+  assert.equal(tools.length, 8, 'every tool is kept');
+  assert.equal(report.dropped.length, 0);
+});
+
+test('filtering tools leaves room the context fitter would otherwise have taken', () => {
+  const body = bigSession({ turns: 10 });
+  body.tools = claudeCodeTools();
+  const before = fitToContext(structuredClone(body), { limit: 32768 }).report;
+
+  const filtered = { ...body, tools: selectTools(body.tools, { mode: 'core' }).tools };
+  const after = fitToContext(filtered, { limit: 32768 }).report;
+
+  assert.ok(after.before < before.before, 'the request starts smaller');
+  assert.ok(after.trimmedTools <= before.trimmedTools, 'and needs no more trimming than before');
 });

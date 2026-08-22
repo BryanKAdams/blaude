@@ -250,6 +250,14 @@ export function localSessionEnv(cfg, { force = false } = {}) {
     // native session. Without it the hook fell back to matching the port, which
     // now varies per account.
     BLAUDE_SESSION: 'local',
+    // A local model's prefill is measured in minutes, not seconds. Claude Code's
+    // default timeout expires mid prefill and reads as a hang.
+    API_TIMEOUT_MS: String(cfg.apiTimeoutMs ?? 900_000),
+    // Claude Code's full system prompt is 7,629 tokens and its tool descriptions
+    // 27,188; this trades some of that guidance for 5,946 fewer tokens of system
+    // prompt and 5,135 fewer of tool text on EVERY turn. A frontier model behind
+    // prompt caching does not care; a 27B re-prefilling locally very much does.
+    ...(cfg.simpleSystemPrompt === false ? {} : { CLAUDE_CODE_SIMPLE_SYSTEM_PROMPT: '1' }),
     ...(window ? { CLAUDE_CODE_MAX_CONTEXT_TOKENS: String(window) } : {}),
   };
 }

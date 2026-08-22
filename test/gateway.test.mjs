@@ -254,3 +254,76 @@ test('tools that cannot work locally are withheld, with an honest note', async (
   assert.match(system, /not available in this session/);
   assert.match(system, /do not invent sources/);
 });
+
+test('an empty completion is reissued rather than passed on as a finished turn', async () => {
+  resetStub();
+  // gemma4 on Ollama's MLX runner does this: a few tokens, no content, no tool
+  // calls. The agent reads it as a finished turn and stops.
+  let call = 0;
+  scripted = {
+    get body() {
+      call++;
+      return {
+        model: 'stub-large',
+        message: call === 1
+          ? { role: 'assistant', content: '' }
+          : { role: 'assistant', content: 'fixed the typo' },
+        done_reason: 'stop',
+        prompt_eval_count: 1234,
+        eval_count: call === 1 ? 3 : 7,
+      };
+    },
+  };
+
+  const res = await post('/v1/messages', {
+    model: 'claude-sonnet-5',
+    max_tokens: 100,
+    messages: [{ role: 'user', content: 'fix it' }],
+  });
+  const msg = await res.json();
+
+  assert.equal(chatCalls().length, 2, 'the empty turn was retried exactly once');
+  assert.equal(msg.content.find((b) => b.type === 'text')?.text, 'fixed the typo');
+});
+
+test('a streamed empty completion is retried without leaking a partial message', async () => {
+  resetStub();
+  let call = 0;
+  scripted = {
+    get stream() {
+      call++;
+      return call === 1
+        ? [{ message: { content: '' } }, { done: true, done_reason: 'stop', eval_count: 3 }]
+        : [{ message: { content: 'fixed ' } }, { message: { content: 'the typo' } },
+           { done: true, done_reason: 'stop', prompt_eval_count: 1234, eval_count: 7 }];
+    },
+  };
+
+  const res = await post('/v1/messages', {
+    model: 'claude-sonnet-5',
+    max_tokens: 100,
+    stream: true,
+    messages: [{ role: 'user', content: 'fix it' }],
+  });
+  const text = await res.text();
+
+  assert.equal(chatCalls().length, 2, 'the empty stream was retried exactly once');
+  // The retry must not produce two Anthropic messages in one response.
+  assert.equal(text.split('event: message_start').length - 1, 1, 'exactly one message_start');
+  assert.equal(text.split('event: message_stop').length - 1, 1, 'exactly one message_stop');
+  assert.ok(text.includes('fixed '), 'the good attempt is delivered');
+});
+
+test('a persistently empty completion is given up on rather than retried forever', async () => {
+  resetStub();
+  scripted = { body: { model: 'stub-large', message: { role: 'assistant', content: '' }, done_reason: 'stop', eval_count: 3 } };
+
+  const res = await post('/v1/messages', {
+    model: 'claude-sonnet-5',
+    max_tokens: 100,
+    messages: [{ role: 'user', content: 'fix it' }],
+  });
+  assert.equal(res.status, 200, 'still a valid response');
+  // 1 initial + emptyCompletionRetries(2).
+  assert.equal(chatCalls().length, 3, 'bounded by emptyCompletionRetries');
+});

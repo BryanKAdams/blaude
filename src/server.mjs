@@ -17,7 +17,7 @@ import {
 import { escalateViaCLI } from './claude-cli.mjs';
 import { cachedCapability, capabilityKey } from './capabilities.mjs';
 import { syntheticSSE } from './stream.mjs';
-import { fitToContext, describeFit } from './fit-context.mjs';
+import { fitToContext, describeFit, selectTools, describeToolSelection } from './fit-context.mjs';
 import { toOllamaRequest, fromOllamaResponse, fromOllamaChunk, newOllamaStreamCursor, NDJSONParser } from './ollama-backend.mjs';
 import { residentContext } from './ollama-admin.mjs';
 
@@ -305,6 +305,16 @@ async function handleMessages({ cfg, log, counters, policy, meter, affinity, req
       `(\`ollama stop <model>\`) or point blaude-small at the same model to get it back.`,
     );
   }
+  // Shed tool definitions the local model will never call, before anything is
+  // measured against the window — they are 78% of Claude Code's fixed floor.
+  if (localBody.tools?.length) {
+    const { tools: kept, report } = selectTools(localBody.tools, cfg.localTools || {});
+    if (report.dropped.length) {
+      localBody = { ...localBody, tools: kept };
+      log.info(`tool trim for ${route.target}: ${describeToolSelection(report)}`);
+    }
+  }
+
   if (cfg.contextFit?.enabled !== false && contextLimit) {
     const { body: fitted, report } = fitToContext(localBody, {
       limit: contextLimit,
@@ -336,17 +346,20 @@ async function handleMessages({ cfg, log, counters, policy, meter, affinity, req
   const onClose = () => controller.abort();
   req.on('close', onClose);
 
+  // Reusable so an empty completion can be reissued. See `emptyCompletionRetries`.
+  const openUpstream = () => fetch(upstreamUrl, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      ...(route.backend.apiKey ? { authorization: `Bearer ${route.backend.apiKey}` } : {}),
+    },
+    body: JSON.stringify(upstreamBody),
+    signal: controller.signal,
+  });
+
   let upstream;
   try {
-    upstream = await fetch(upstreamUrl, {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        ...(route.backend.apiKey ? { authorization: `Bearer ${route.backend.apiKey}` } : {}),
-      },
-      body: JSON.stringify(upstreamBody),
-      signal: controller.signal,
-    });
+    upstream = await openUpstream();
   } catch (err) {
     req.off('close', onClose);
     counters.errors++;
@@ -370,9 +383,19 @@ async function handleMessages({ cfg, log, counters, policy, meter, affinity, req
   }
 
   if (!openaiReq.stream) {
+    let rawBody = await upstream.json();
+    let completion = isOllama ? fromOllamaResponse(rawBody) : rawBody;
+    // An empty turn is never a usable answer; reissue rather than hand it on.
+    const retries = cfg.emptyCompletionRetries ?? 2;
+    for (let attempt = 1; attempt <= retries && isEmptyCompletion(completion); attempt++) {
+      log.warn(`${route.target} returned an empty completion; retrying (${attempt}/${retries})`);
+      const retry = await openUpstream().catch(() => null);
+      if (!retry?.ok) break;
+      rawBody = await retry.json().catch(() => null);
+      if (!rawBody) break;
+      completion = isOllama ? fromOllamaResponse(rawBody) : rawBody;
+    }
     req.off('close', onClose);
-    const rawBody = await upstream.json();
-    const completion = isOllama ? fromOllamaResponse(rawBody) : rawBody;
     detectTruncation({ log, route, completion, inputEstimate, contextLimit });
     const anthropic = openAIToAnthropic(completion, {
       requestedModel: body.model,
@@ -392,10 +415,33 @@ async function handleMessages({ cfg, log, counters, policy, meter, affinity, req
   }
 
   counters.streamed++;
-  return relayStream({ cfg, log, counters, req, res, body, route, upstream, inputEstimate, t0, onClose, decision, isOllama, contextLimit });
+  return relayStream({ cfg, log, counters, req, res, body, route, upstream, inputEstimate, t0, onClose, decision, isOllama, contextLimit, openUpstream });
 }
 
-async function relayStream({ cfg, log, counters, req, res, body, route, upstream, inputEstimate, t0, onClose, decision, isOllama = false, contextLimit = null }) {
+/**
+ * True when a completion carries nothing an agent can act on.
+ *
+ * Measured against gemma4:26b-mlx on Ollama's MLX runner: on the turn *after* a
+ * tool result, it returns no content and no tool calls 7 times in 10, having
+ * generated exactly 3 tokens (`eval_count=3`, `done_reason=stop`). Those tokens
+ * look like a tool-call opening marker that Ollama's gemma4 parser consumes and
+ * then yields nothing for, so they never reach Blaude and no scanner here can
+ * recover them.
+ *
+ * Claude Code reads the result as a finished turn and stops — the model appears
+ * to say "let me fix that" and give up. Reissuing the request is the only lever
+ * available downstream of the parser, and it works because the failure is
+ * intermittent rather than deterministic.
+ */
+export function isEmptyCompletion(completion) {
+  const msg = completion?.choices?.[0]?.message;
+  if (!msg) return true;
+  if (msg.tool_calls?.length) return false;
+  const text = typeof msg.content === 'string' ? msg.content : '';
+  return text.trim() === '';
+}
+
+async function relayStream({ cfg, log, counters, req, res, body, route, upstream, inputEstimate, t0, onClose, decision, isOllama = false, contextLimit = null, openUpstream = null }) {
   res.writeHead(200, {
     'content-type': 'text/event-stream',
     'cache-control': 'no-cache, no-transform',
@@ -403,53 +449,89 @@ async function relayStream({ cfg, log, counters, req, res, body, route, upstream
     'x-blaude-route': `${route.backendName}/${route.model}`,
   });
 
-  const builder = new AnthropicSSEBuilder({
-    requestedModel: body.model,
-    messageId: newMessageId(),
-    inputTokens: inputEstimate,
-    thinking: cfg.thinking,
-    textToolCalls: cfg.textToolCalls,
-  });
-  const parser = isOllama ? new NDJSONParser() : new SSEParser();
-  // Shared across every line of this response so tool calls keep distinct indices.
-  const ollamaCursor = newOllamaStreamCursor();
   const write = (event) => { if (!res.writableEnded) res.write(serializeSSE(event)); };
+  const retries = openUpstream ? (cfg.emptyCompletionRetries ?? 2) : 0;
 
+  let builder;
   let firstTokenMs = null;
-  const emit = (payloads) => {
-    const events = [];
-    for (const payload of payloads) {
-      if (payload === '[DONE]') continue;
-      if (payload.error) throw new Error(payload.error.message || JSON.stringify(payload.error));
-      // Ollama's native stream is NDJSON in its own shape; normalise it.
-      const normalised = isOllama ? fromOllamaChunk(payload, ollamaCursor) : [payload];
-      for (const p of normalised) events.push(...builder.pushChunk(p));
-    }
-    for (const e of events) {
-      if (firstTokenMs === null && e.event === 'content_block_delta') firstTokenMs = performance.now() - t0;
-      write(e);
-    }
-  };
+  let current = upstream;
 
-  try {
-    const decoder = new TextDecoder();
-    for await (const chunk of upstream.body) emit(parser.push(decoder.decode(chunk, { stream: true })));
-    // A last line without its terminator still carries the stop reason and the
-    // usage totals, and neither parser surfaces it until asked.
-    emit(parser.push(decoder.decode()));
-    emit(parser.flush());
-    for (const e of builder.finish()) write(e);
-    res.end();
-  } catch (err) {
-    counters.errors++;
-    if (!req.destroyed && !res.writableEnded) {
-      // Mid-stream failures must still terminate the Anthropic event sequence.
-      log.error(`stream from ${route.backendName} failed: ${err.message}`);
-      write({ event: 'error', data: { type: 'error', error: { type: 'api_error', message: err.message } } });
+  // Events are held back until the response proves it has something to say.
+  //
+  // Nothing can be un-sent once written, so a retry is only possible while the
+  // buffer is unflushed. An empty turn produces no deltas at all and ends after
+  // a handful of tokens, so the hold costs nothing in the failing case; in the
+  // succeeding case it releases on the first delta and time-to-first-token is
+  // unchanged.
+  for (let attempt = 0; ; attempt++) {
+    builder = new AnthropicSSEBuilder({
+      requestedModel: body.model,
+      messageId: newMessageId(),
+      inputTokens: inputEstimate,
+      thinking: cfg.thinking,
+      textToolCalls: cfg.textToolCalls,
+    });
+    const parser = isOllama ? new NDJSONParser() : new SSEParser();
+    // Shared across every line of this response so tool calls keep distinct indices.
+    const ollamaCursor = newOllamaStreamCursor();
+
+    const held = [];
+    let sawOutput = false;
+    const isOutput = (e) => e.event === 'content_block_delta'
+      || (e.event === 'content_block_start' && e.data?.content_block?.type === 'tool_use');
+
+    const emit = (payloads) => {
+      const events = [];
+      for (const payload of payloads) {
+        if (payload === '[DONE]') continue;
+        if (payload.error) throw new Error(payload.error.message || JSON.stringify(payload.error));
+        // Ollama's native stream is NDJSON in its own shape; normalise it.
+        const normalised = isOllama ? fromOllamaChunk(payload, ollamaCursor) : [payload];
+        for (const p of normalised) events.push(...builder.pushChunk(p));
+      }
+      for (const e of events) {
+        if (!sawOutput && isOutput(e)) sawOutput = true;
+        if (!sawOutput) { held.push(e); continue; }
+        if (held.length) { for (const h of held) write(h); held.length = 0; }
+        if (firstTokenMs === null && e.event === 'content_block_delta') firstTokenMs = performance.now() - t0;
+        write(e);
+      }
+    };
+
+    try {
+      const decoder = new TextDecoder();
+      for await (const chunk of current.body) emit(parser.push(decoder.decode(chunk, { stream: true })));
+      // A last line without its terminator still carries the stop reason and the
+      // usage totals, and neither parser surfaces it until asked.
+      emit(parser.push(decoder.decode()));
+      emit(parser.flush());
+
+      if (!sawOutput && attempt < retries) {
+        log.warn(`${route.target} streamed an empty completion; retrying (${attempt + 1}/${retries})`);
+        const retry = await openUpstream().catch(() => null);
+        if (retry?.ok && retry.body) { current = retry; continue; }
+      }
+
+      for (const h of held) write(h);
       for (const e of builder.finish()) write(e);
       res.end();
+      break;
+    } catch (err) {
+      counters.errors++;
+      if (!req.destroyed && !res.writableEnded) {
+        // Mid-stream failures must still terminate the Anthropic event sequence.
+        log.error(`stream from ${route.backendName} failed: ${err.message}`);
+        for (const h of held) write(h);
+        write({ event: 'error', data: { type: 'error', error: { type: 'api_error', message: err.message } } });
+        for (const e of builder.finish()) write(e);
+        res.end();
+      }
+      break;
     }
-  } finally {
+  }
+
+  {
+
     req.off('close', onClose);
     const ms = performance.now() - t0;
     const s = builder.stats();

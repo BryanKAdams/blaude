@@ -255,3 +255,23 @@ test('a failed escalation falls back to the local backend, in the backend\'s own
     else process.env.BLAUDE_CLAUDE_BIN = previousBin;
   }
 });
+
+test('tool descriptions are given up one at a time, not all at once', () => {
+  // Enough tool documentation to blow the budget on its own, so step 3 must act.
+  const tools = Array.from({ length: 24 }, (_, i) => ({
+    name: `Tool${i}`,
+    description: `First line of tool ${i}.\n${`Detail paragraph for tool ${i}. `.repeat(150)}`,
+    input_schema: { type: 'object', properties: {} },
+  }));
+  const messages = [{ role: 'user', content: 'the task' }];
+
+  const { body, report } = fitToContext({ messages, tools, system: 'sys' }, { limit: 32768, reserveOutput: 4096 });
+
+  assert.ok(report.after <= report.budget, 'still within budget');
+  assert.ok(report.trimmedTools > 0, 'it did have to trim something');
+  // The whole point: stop at the budget, keep the rest of the documentation.
+  assert.ok(report.trimmedTools < tools.length, `kept some descriptions (trimmed ${report.trimmedTools}/${tools.length})`);
+  assert.ok(body.tools.some((t) => t.description.includes('Detail paragraph')), 'some docs survive in full');
+  assert.ok(report.budget - report.after < 2000, 'no large slice of the budget is left unused');
+  assert.equal(report.trimmedSystem, false, 'the system prompt is never reached');
+});
