@@ -183,10 +183,49 @@ MLX is the better backend for a large model on Apple Silicon: it uses the model'
 own context length instead of a daemon-wide cap, and unified memory means no
 separate VRAM budget.
 
+### Running a 27B-class model
+
+Prefill, not generation, is what you wait for — so the wins are all in sending
+fewer tokens and sending the same ones twice. Blaude does both by default
+(`localTools`, `simpleSystemPrompt`; see *What we measured*). Two things it
+cannot do for you:
+
+- **`OLLAMA_NUM_PARALLEL=1`.** More slots let two heavy requests share one GPU and
+  halve each other: measured 173s and 94s for a concurrent pair, against 2.9s for
+  the same work run alone. Raise it only if you want the Ollama GUI to stay
+  responsive while Blaude is busy, and know you are trading throughput for it.
+- **Keep one model resident.** Ollama sizes context to fit memory, so a second
+  model does not just cost RAM, it shrinks the window of the first. `blaude use`
+  points both roles at the same weights for this reason.
+
+The gateway holds code in memory: `blaude serve` does hot-reload `config.json`,
+but **not** source. After changing Blaude itself, kill the running gateway or
+your session keeps using the old code — the logs will still say
+`config reloaded` while nothing else changes.
+
+### Known upstream issues
+
+Neither is Blaude's, both are worked around, and both are worth recognising in a
+log rather than mistaking for a bad model:
+
+- **gemma4 on Ollama's MLX runner returns empty turns.** On the turn *after* a
+  tool result it produces no content and no tool calls roughly 7 times in 10,
+  having generated exactly 3 tokens (`eval_count=3`, `done_reason=stop`) that its
+  parser consumes. The agent reads the empty turn as a finished one and stops.
+  Blaude retries (`emptyCompletionRetries`), which takes it from ~30% to ~88%
+  usable — but each retry is a fresh prefill, so qwen remains the better choice
+  for agentic work.
+- **The MLX runner subprocess sometimes dies mid-request**, surfacing as
+  `500 {"error":"Post .../v1/completions: EOF"}` after minutes of work. If a turn
+  runs long, `grep 500 ~/.blaude/gateway.log` tells you whether you are watching
+  a slow prefill or a crash.
+
 ## What we measured
 
-Findings from building this on an M4 Pro / 48 GB, all reproducible with
-`blaude doctor`:
+Findings from building this on an M4 Pro / 48 GB. The backend and context
+figures are reproducible with `blaude doctor`; the prompt-size and prefill
+numbers below were captured from real sessions and are quoted as measured, not
+as guarantees for your hardware:
 
 - **`claude -p "/usage"` is free.** It is a client-side command: zero tokens,
   `total_cost_usd: 0`, ~1.1s. That makes exact allowance percentages available to
@@ -216,7 +255,32 @@ Findings from building this on an M4 Pro / 48 GB, all reproducible with
   local models by default and offers `blaude search` instead.
 - **Latency, not intelligence, is the practical limit.** qwen3:8b served a real
   Claude Code turn at 5–11 tok/s with a 72s time-to-first-token on a 17.8k prompt.
-  Prompt evaluation dominates. A 27B model will be slower per token.
+  Prompt evaluation dominates, and it dominates harder as models grow.
+- **Claude Code's fixed overhead is larger than a 27B's whole context window.**
+  Captured from a real one-word prompt: 7,629 tokens of system prompt and 27,549
+  of tool definitions across 25 tools — a **35,178-token floor** before you type
+  anything, against the 32,768 such a model runs in. Tool definitions are 78% of
+  it, and the largest are orchestration a local model never calls: `Workflow`
+  alone is 5,927 tokens, roughly a minute of prefill every turn. Blaude drops
+  those for local routes (`localTools`) and asks Claude Code for its abbreviated
+  prompt (`simpleSystemPrompt`), which together take the floor to **5,399**.
+  Neither applies to Claude, which has prompt caching and does not care.
+- **Ollama caches the prefix, but only if you keep it identical.** It does not
+  support Anthropic's `cache_control`, and does not need to — its runner keeps a
+  KV prefix cache automatically. Measured on the same 21k prefix three turns
+  running: 178.4s → 42.0s → 0.3s. The catch is that it matches a *byte-identical*
+  prefix, so anything that rewrites the front of the prompt between turns throws
+  the cache away. Blaude's own trimming used to do exactly that — 19 tool
+  descriptions cut on one request and 23 on the next — which is why logs showed
+  `matched=0` forever. Shrinking the prompt matters; keeping it *stable* matters
+  as much.
+- **Measured on qwen3.6 27B (M4 Pro / 48 GB, Ollama's MLX runner).** Prefill runs
+  at ~100–120 tok/s, so cost is set almost entirely by prompt size. Before the
+  two changes above: 28,730–80,255-token prompts, 150s–900s per turn, and turns
+  that timed out client-side while the backend kept grinding. After: ~9,000-token
+  prompts, a **2.9s** warm turn against a cache reporting `matched=9011/9066`.
+  The first turn of a session still pays a full cold prefill — expect ~60–90s —
+  and nothing makes that free.
 
 ## What Blaude will not do
 
@@ -258,6 +322,7 @@ Findings from building this on an M4 Pro / 48 GB, all reproducible with
 | `blaude stats` | what Blaude has served |
 | `blaude serve` | run the gateway in the foreground |
 | `blaude init` | write a config file |
+| `blaude update` | install the latest release (`--check`, `--rollback`) |
 
 Model prefixes override policy for one request: `local/blaude-small` forces
 local, `cloud/opus` forces Claude, `audit/opus` classifies as an audit.
@@ -288,10 +353,11 @@ Zero runtime dependencies; Node ≥ 20. The pieces:
 | `src/stream.mjs` | Anthropic SSE event machine |
 | `src/text-scanner.mjs` | `<think>` / `<tool_call>` parsing, streaming-safe |
 | `src/ollama-backend.mjs` | Ollama's native API as an OpenAI shape |
-| `src/fit-context.mjs` | deliberate prompt trimming |
+| `src/fit-context.mjs` | deliberate prompt trimming; local tool selection |
 | `src/claude-cli.mjs` | subscription escalation via `claude -p` |
 | `src/handoff.mjs` | free session handoff from transcripts |
 | `src/ollama-admin.mjs` | daemon context cap; real allocated context |
+| `src/update.mjs` | in-place updates from GitHub Releases, and rollback |
 
 Everything that depends on undocumented Claude Code internals is confined to
 `usage-command.mjs`, `claude-usage.mjs`, and `claude-cli.mjs` — if a format

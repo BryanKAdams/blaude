@@ -67,6 +67,21 @@
 
   "contextFit": { "enabled": true, "reserveOutput": 4096, "maxToolResultChars": 4000 },
 
+  "//localTools": "Which tool definitions reach a local model. Claude Code sends ~27,500 tokens of them across 25 tools, and the largest are orchestration a local model never calls. mode 'core' keeps a coding core, 'all' sends everything; `also` adds names or globs, e.g. [\"mcp__github__*\"].",
+  "localTools": { "mode": "core", "also": [] },
+
+  "//simpleSystemPrompt": "Ask Claude Code for its abbreviated system prompt and tool descriptions when the session runs locally. Takes the fixed floor from 34,817 tokens to 23,736 alone, 5,399 combined with localTools. Never applies to Claude.",
+  "simpleSystemPrompt": true,
+
+  "//emptyCompletionRetries": "Reissue a request that came back with no text and no tool calls. Some local builds do this intermittently and the agent reads the empty turn as a finished one. 0 disables.",
+  "emptyCompletionRetries": 2,
+
+  "//apiTimeoutMs": "How long Claude Code waits on one request. Its default expires mid-prefill on a large local model and reads as a hang, while the backend keeps working.",
+  "apiTimeoutMs": 900000,
+
+  "//updates": "Where `blaude update` looks for releases.",
+  "updates": { "repo": "BryanKAdams/blaude" },
+
   "//pricing": "Optional, only for cost estimates in `blaude stats`. Blaude ships no guessed prices.",
   "pricing": {
     "referenceModel": "claude-sonnet-4-5",
