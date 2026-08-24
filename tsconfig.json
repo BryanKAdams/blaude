@@ -1,0 +1,39 @@
+{
+  // Blaude ships as source and never compiles, so this checker only ever reads:
+  // `noEmit` is the point, not a concession. It exists because the JSDoc on the
+  // protocol-translation layer was previously unverified, and `@param {object}`
+  // — which is what several of those annotations said — declares a type with no
+  // properties, so every real field access is an error while every typo is fine.
+  // That is strictly worse than no annotation at all.
+  //
+  // `include` is an allowlist, not the whole tree, because a check that cannot
+  // pass is a check nobody runs. Everything listed is clean and `npm test`
+  // fails if that stops being true. The files NOT listed yet:
+  //
+  //   cli.mjs (133)  server.mjs (65)  claude-cli.mjs (24)  policy.mjs (23)
+  //   update.mjs (17)  simulate.mjs (14)  ollama-admin.mjs (8)
+  //   capabilities.mjs (8)  usage-command.mjs (4)  claude-usage.mjs (3)
+  //   account.mjs (2)  config.mjs (1)
+  //
+  // Add a file here once it is clean. cli.mjs is 2,000 lines and wants
+  // splitting before typing; that is a refactor, not an annotation pass.
+  "compilerOptions": {
+    "allowJs": true,
+    "checkJs": true,
+    "noEmit": true,
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "target": "es2023",
+    "lib": ["es2023"],
+    "types": ["node"],
+    "strict": true,
+    // The codebase is JS with partial JSDoc: requiring an annotation on every
+    // parameter would bury the shape errors this is here to find.
+    "noImplicitAny": false,
+    "skipLibCheck": true
+  },
+  // Tests are excluded on purpose. Their fixtures are deliberately partial —
+  // a half-built request body IS the test — so checking them reports the very
+  // shapes each case was written to construct.
+  "include": ["bin/**/*.mjs", "src/**/*.mjs"]
+}

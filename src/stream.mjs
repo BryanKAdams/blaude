@@ -12,6 +12,14 @@ import { newMessageId, newToolUseId, tokensFromChars, mapStopReason } from './op
 import { TextScanner } from './text-scanner.mjs';
 
 export class AnthropicSSEBuilder {
+  /**
+   * @param {object} [opts]
+   * @param {string} [opts.requestedModel]
+   * @param {string} [opts.messageId]
+   * @param {number} [opts.inputTokens]
+   * @param {'strip'|'text'} [opts.thinking]
+   * @param {boolean} [opts.textToolCalls]
+   */
   constructor({
     requestedModel = 'blaude',
     messageId = newMessageId(),
@@ -38,6 +46,7 @@ export class AnthropicSSEBuilder {
   }
 
   // --- event helpers ---------------------------------------------------------
+  /** @returns {Array<import('./wire-types.mjs').AnthropicSSEEvent>} */
   #start() {
     if (this.started) return [];
     this.started = true;
@@ -59,6 +68,7 @@ export class AnthropicSSEBuilder {
     }];
   }
 
+  /** @returns {Array<import('./wire-types.mjs').AnthropicSSEEvent>} */
   #closeBlock() {
     if (!this.openBlock) return [];
     const index = this.openBlock.index;
@@ -66,6 +76,7 @@ export class AnthropicSSEBuilder {
     return [{ event: 'content_block_stop', data: { type: 'content_block_stop', index } }];
   }
 
+  /** @returns {Array<import('./wire-types.mjs').AnthropicSSEEvent>} */
   #openText() {
     if (this.openBlock?.kind === 'text') return [];
     const events = this.#closeBlock();
@@ -78,18 +89,22 @@ export class AnthropicSSEBuilder {
     return events;
   }
 
+  /** @returns {Array<import('./wire-types.mjs').AnthropicSSEEvent>} */
   #emitText(text) {
     if (!text) return [];
     this.outputChars += text.length;
     const events = this.#openText();
+    const block = this.openBlock;
+    if (!block) throw new Error('unreachable: #openText leaves a text block open');
     events.push({
       event: 'content_block_delta',
-      data: { type: 'content_block_delta', index: this.openBlock.index, delta: { type: 'text_delta', text } },
+      data: { type: 'content_block_delta', index: block.index, delta: { type: 'text_delta', text } },
     });
     return events;
   }
 
   /** A complete tool call discovered in the text stream. */
+  /** @returns {Array<import('./wire-types.mjs').AnthropicSSEEvent>} */
   #emitWholeToolUse({ name, input }) {
     const events = this.#closeBlock();
     const index = this.nextIndex++;
@@ -115,7 +130,8 @@ export class AnthropicSSEBuilder {
   }
 
   // --- main entry points ----------------------------------------------------
-  /** @param {object} chunk a parsed OpenAI SSE `data:` payload */
+  /** @param {import('./wire-types.mjs').OpenAICompletion} chunk a parsed OpenAI SSE `data:` payload */
+  /** @returns {Array<import('./wire-types.mjs').AnthropicSSEEvent>} */
   pushChunk(chunk) {
     const events = [];
     if (!chunk || typeof chunk !== 'object') return events;
@@ -153,6 +169,7 @@ export class AnthropicSSEBuilder {
     return events;
   }
 
+  /** @returns {Array<import('./wire-types.mjs').AnthropicSSEEvent>} */
   #pushNativeToolDelta(tc) {
     const key = tc.index ?? 0;
     let state = this.nativeTools.get(key);
@@ -206,6 +223,7 @@ export class AnthropicSSEBuilder {
   }
 
   /** Flush held-back text, close blocks, and emit the terminal events. */
+  /** @returns {Array<import('./wire-types.mjs').AnthropicSSEEvent>} */
   finish() {
     if (this.stopped) return [];
     this.stopped = true;
@@ -312,6 +330,7 @@ export class SSEParser {
  * caller asked for a stream.
  */
 export function syntheticSSE(message) {
+  /** @type {Array<import('./wire-types.mjs').AnthropicSSEEvent>} */
   const events = [{
     event: 'message_start',
     data: {

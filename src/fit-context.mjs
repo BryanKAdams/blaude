@@ -52,6 +52,23 @@ export const CORE_TOOLS = [
 ];
 
 /**
+ * Names of every tool the conversation has already called.
+ *
+ * @param {Array<{content?: string|Array<{type?: string, name?: string}>}>} messages
+ * @returns {string[]}
+ */
+export function toolsUsedInHistory(messages = []) {
+  const used = new Set();
+  for (const m of messages) {
+    const blocks = typeof m?.content === 'string' ? [] : (m?.content || []);
+    for (const b of blocks) {
+      if (b?.type === 'tool_use' && b.name) used.add(b.name);
+    }
+  }
+  return [...used];
+}
+
+/**
  * Drops tool definitions a local model will never call.
  *
  * Measured on a one-word prompt, Claude Code sends 7,629 tokens of system prompt
@@ -65,20 +82,10 @@ export const CORE_TOOLS = [
  * the set is an explicit allowlist, it applies only to local routes, and what it
  * removed is logged rather than silently swallowed.
  *
- * @returns {{tools:Array|undefined, report:{dropped:string[], keptCount:number, savedTokens:number}}}
+ * @returns {{tools:Array|undefined, report:{dropped:string[], kept:string[], keptCount:number, savedTokens:number}}}
  */
-export function toolsUsedInHistory(messages = []) {
-  const used = new Set();
-  for (const m of messages) {
-    const blocks = typeof m?.content === 'string' ? [] : (m?.content || []);
-    for (const b of blocks) {
-      if (b?.type === 'tool_use' && b.name) used.add(b.name);
-    }
-  }
-  return [...used];
-}
-
 export function selectTools(tools, { mode = 'core', allow = CORE_TOOLS, also = [], keepUsed = [] } = {}) {
+  /** @type {{dropped: string[], kept: string[], keptCount: number, savedTokens: number}} */
   const report = { dropped: [], kept: [], keptCount: Array.isArray(tools) ? tools.length : 0, savedTokens: 0 };
   if (mode === 'all' || !Array.isArray(tools) || !tools.length) return { tools, report };
 
@@ -87,6 +94,7 @@ export function selectTools(tools, { mode = 'core', allow = CORE_TOOLS, also = [
   // absent from the request fails as "No such tool available", losing the turn.
   // Dropping definitions is only safe for tools nothing has touched yet.
   const patterns = [...allow, ...also, ...keepUsed];
+  /** @type {any[]} */
   const keep = [];
   for (const t of tools) {
     const name = t?.name || t?.function?.name || '';
@@ -118,9 +126,9 @@ export function describeToolSelection(report) {
 }
 
 /**
- * @param {object} body    Anthropic request body
- * @param {object} opts
- * @param {number} opts.limit          real context ceiling in tokens
+ * @param {import('./wire-types.mjs').AnthropicRequest} body    Anthropic request body
+ * @param {object} [opts]
+ * @param {number} [opts.limit]        real context ceiling in tokens
  * @param {number} [opts.reserveOutput] tokens to leave for the reply
  * @param {number} [opts.maxToolResultChars]
  * @returns {{body:object, report:object}}
@@ -130,10 +138,15 @@ export function fitToContext(body, {
   reserveOutput = 4096,
   maxToolResultChars = 4000,
 } = {}) {
+  /** @type {{fitted: boolean, limit: number|undefined, budget: number|null, before: number, after: number, truncatedResults: number, droppedMessages: number, trimmedTools: number, trimmedSystem: boolean, orphanResultsDemoted: number}} */
   const report = {
     fitted: false, limit, budget: null,
     before: 0, after: 0,
     truncatedResults: 0, droppedMessages: 0, trimmedTools: 0, trimmedSystem: false,
+    // Initialised here rather than only assigned on the path that demotes: a
+    // report whose fields appear and disappear makes the log read as though the
+    // step never ran when it ran and found nothing.
+    orphanResultsDemoted: 0,
   };
   if (!limit || !Array.isArray(body.messages)) return { body, report };
 
@@ -222,7 +235,7 @@ export function fitToContext(body, {
   let tools = body.tools;
   if (total() > budget && Array.isArray(tools) && tools.length) {
     tools = tools.slice();
-    const retally = () => { toolTokens = tools.reduce((n, t) => n + estimateTokens(t), 0); };
+    const retally = () => { toolTokens = (tools || []).reduce((n, t) => n + estimateTokens(t), 0); };
     // Longest first: each trim buys the most room, so fewest tools lose their docs.
     const order = tools
       .map((t, i) => ({ i, len: String(t.description || '').length }))

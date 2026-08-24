@@ -159,8 +159,9 @@ export function convertToolChoice(choice) {
 }
 
 /**
- * @param {object} body  Anthropic /v1/messages request body
- * @param {object} route resolved route from router.resolveModel
+ * @param {import('./wire-types.mjs').AnthropicRequest} body  Anthropic /v1/messages request body
+ * @param {import('./wire-types.mjs').Route} route resolved route from router.resolveModel
+ * @returns {import('./wire-types.mjs').OpenAIRequest}
  */
 export function anthropicToOpenAI(body, route, cfg = {}) {
   if (!body || typeof body !== 'object') throw new TranslateError('Request body must be a JSON object');

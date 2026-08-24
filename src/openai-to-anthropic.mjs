@@ -46,8 +46,12 @@ function nativeToolBlocks(toolCalls) {
 }
 
 /**
- * @param {object} completion OpenAI completion body
- * @param {object} opts {requestedModel, thinking, textToolCalls, inputTokenEstimate}
+ * @param {import('./wire-types.mjs').OpenAICompletion} completion OpenAI completion body
+ * @param {object} [opts]
+ * @param {string} [opts.requestedModel]
+ * @param {'strip'|'text'} [opts.thinking]
+ * @param {boolean} [opts.textToolCalls]
+ * @param {number} [opts.inputTokenEstimate]
  */
 export function openAIToAnthropic(completion, opts = {}) {
   const {
@@ -63,7 +67,7 @@ export function openAIToAnthropic(completion, opts = {}) {
   const rawContent = typeof msg.content === 'string'
     ? msg.content
     : Array.isArray(msg.content)
-      ? msg.content.map((p) => (typeof p === 'string' ? p : p?.text ?? '')).join('')
+      ? /** @type {Array<string|{text?: string}>} */ (msg.content).map((p) => (typeof p === 'string' ? p : p?.text ?? '')).join('')
       : '';
 
   // Some servers expose reasoning on its own field instead of in <think> tags.

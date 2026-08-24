@@ -59,7 +59,7 @@ sides have to be working before it has anything to route between.
 ```bash
 npm install -g @anthropic-ai/claude-code    # then run `claude` once to log in
 brew install ollama && ollama serve         # or https://ollama.com
-ollama pull qwen3:14b                       # any tool-capable model
+ollama pull <a tool-capable model>          # see "Which model" below
 ```
 
 Pick a model that **supports tool calling** — a coding agent is mostly tool
@@ -84,9 +84,14 @@ To run from a clone instead — the right choice if you intend to hack on it:
 ```bash
 git clone https://github.com/BryanKAdams/blaude.git
 cd blaude
-npm test                                          # no dependencies to install
+npm install                                       # dev only: the type checker
+npm test                                          # types + 123 tests
 ln -s "$PWD/bin/blaude.mjs" ~/.local/bin/blaude   # anywhere on your PATH
 ```
+
+Blaude has **no runtime dependencies** — `npm install` here pulls TypeScript and
+`@types/node` only, to typecheck the JSDoc. What you run has an empty dependency
+tree, which for a process sitting in your agent's request path is deliberate.
 
 ## Quick start
 
@@ -230,6 +235,32 @@ nor Blaude authenticates anything, so keep this on a network you trust.
 MLX is the better backend for a large model on Apple Silicon: it uses the model's
 own context length instead of a daemon-wide cap, and unified memory means no
 separate VRAM budget.
+
+### Which model
+
+What worked best on an M4 Pro / 48 GB, by a wide margin:
+
+```bash
+ollama pull codecraftersllc/ornith-1.5-35b-a3b-abliterated:latest
+```
+
+The useful part is *why*, because it generalises past this one model. **A3B means
+mixture-of-experts with roughly 3B active parameters**, so despite being nominally
+35B it prefills and generates like a small model while answering like a large
+one. Since prefill is what you wait for — see *What we measured* — active
+parameter count matters far more than the headline size. A dense 27B is the
+slower choice even though the number is smaller.
+
+The Qwen3 builds were all worse here: too slow to use, or they fell into
+repetition loops. `qwen3.6:27b-modelopt-nvfp4` in particular is quantised in a
+format aimed at NVIDIA hardware, which is not what a Mac is running.
+
+Two caveats on the recommendation. It is one person's result on one machine, not
+a benchmark — your mileage will differ, and `blaude doctor` is how you find out
+rather than guessing. And "abliterated" means the model's refusal behaviour has
+been stripped out by a third-party fine-tune; it is popular for coding because it
+stops declining ordinary work, but you are running an unaligned model from an
+unofficial repo, which is worth knowing rather than discovering.
 
 ### Running a 27B-class model
 
@@ -385,10 +416,23 @@ with commentary.
 ## Development
 
 ```bash
-npm test        # no network, no dependencies
+npm install     # dev only: TypeScript, for the JSDoc check
+npm test        # typecheck + 123 tests, no network
+npm run typecheck
 ```
 
-Zero runtime dependencies; Node ≥ 20. The pieces:
+Zero *runtime* dependencies; Node ≥ 20.
+
+`npm test` runs `tsc --checkJs` before the suite. Blaude never compiles — the
+tarball is the source — so the checker only ever reads, and it exists for one
+layer: the protocol translation, where a wrong shape becomes a mangled tool call
+instead of a crash. Those files (`anthropic-to-openai`, `openai-to-anthropic`,
+`stream`, `text-scanner`, `fit-context`) are clean and the build fails if that
+changes. `src/wire-types.mjs` holds the shapes; it is JSDoc only and emits
+nothing. Files still carrying `// @ts-nocheck` are the backlog — delete the line
+and fix what it reports.
+
+The pieces:
 
 | file | responsibility |
 |---|---|
@@ -396,6 +440,7 @@ Zero runtime dependencies; Node ≥ 20. The pieces:
 | `src/policy.mjs` | purpose classification, floors, turn affinity |
 | `src/usage-command.mjs` | reads `/usage` (the authoritative source) |
 | `src/claude-usage.mjs` | transcript-based fallback + 429 anchors |
+| `src/wire-types.mjs` | JSDoc shapes for both wire protocols (no runtime code) |
 | `src/anthropic-to-openai.mjs` | request translation |
 | `src/openai-to-anthropic.mjs` | response translation |
 | `src/stream.mjs` | Anthropic SSE event machine |

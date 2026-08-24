@@ -16,7 +16,7 @@ const MAX_SENTINEL = Math.max(...ALL_SENTINELS.map((s) => s.length));
 
 /** Earliest occurrence of any needle in haystack. */
 function firstOf(haystack, needles, from = 0) {
-  let best = { index: -1, needle: null };
+  let best = { index: -1, needle: '' };
   for (const needle of needles) {
     const i = haystack.indexOf(needle, from);
     if (i !== -1 && (best.index === -1 || i < best.index)) best = { index: i, needle };
@@ -39,6 +39,7 @@ export function parseToolCallPayload(raw) {
   const trimmed = String(raw ?? '').trim();
   if (!trimmed) return null;
 
+  /** @type {any} */
   let obj = null;
   try {
     obj = JSON.parse(trimmed);
@@ -65,9 +66,9 @@ export function parseToolCallPayload(raw) {
 
 export class TextScanner {
   /**
-   * @param {object} opts
-   * @param {'strip'|'text'} opts.thinking  what to do with reasoning traces
-   * @param {boolean} opts.textToolCalls    parse text-embedded tool calls
+   * @param {object} [opts]
+   * @param {'strip'|'text'} [opts.thinking]  what to do with reasoning traces
+   * @param {boolean} [opts.textToolCalls]    parse text-embedded tool calls
    */
   constructor({ thinking = 'strip', textToolCalls = true } = {}) {
     this.thinking = thinking;

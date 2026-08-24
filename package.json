@@ -10,9 +10,10 @@
     "node": ">=20"
   },
   "scripts": {
-    "test": "node --test test/*.test.mjs",
+    "test": "tsc -p tsconfig.json && node --test test/*.test.mjs",
     "serve": "node bin/blaude.mjs serve",
-    "doctor": "node bin/blaude.mjs doctor"
+    "doctor": "node bin/blaude.mjs doctor",
+    "typecheck": "tsc -p tsconfig.json"
   },
   "files": [
     "bin",
@@ -41,5 +42,9 @@
     "local-llm",
     "gateway",
     "proxy"
-  ]
+  ],
+  "devDependencies": {
+    "@types/node": "^26.2.0",
+    "typescript": "^7.0.2"
+  }
 }
