@@ -44,9 +44,32 @@ Code — it sits underneath it. `@file` mentions, slash commands, skills, plugin
 MCP servers, hooks, shift+tab permission modes, images, `/resume`: all unchanged.
 Tools still execute in your working directory. Only the model changes.
 
+## What you need first
+
+Blaude routes between Claude Code and a local model, and installs neither. Both
+sides have to be working before it has anything to route between.
+
+| | why |
+|---|---|
+| **Node 20+** | Blaude uses built-in `fetch` and `node:test`, and has no dependencies |
+| **Claude Code**, logged in | Blaude launches it, and reads `/usage` for your real allowance |
+| **A Claude subscription** (Pro or Max) | allowance routing is the entire point; a pay-per-token API key has no `/usage` to read |
+| **Ollama** with one model pulled | the local half. MLX on Apple Silicon works too |
+
+```bash
+npm install -g @anthropic-ai/claude-code    # then run `claude` once to log in
+brew install ollama && ollama serve         # or https://ollama.com
+ollama pull qwen3:14b                       # any tool-capable model
+```
+
+Pick a model that **supports tool calling** — a coding agent is mostly tool
+calls, and a model that cannot make them cannot do the work. `blaude doctor`
+probes for this and tells you which of native, text-parsed, or no tool calling
+you actually got.
+
 ## Install
 
-Blaude needs Node 20 or newer, and the `claude` CLI already logged in.
+Blaude itself:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/BryanKAdams/blaude/main/install.sh | bash
@@ -68,12 +91,18 @@ ln -s "$PWD/bin/blaude.mjs" ~/.local/bin/blaude   # anywhere on your PATH
 ## Quick start
 
 ```bash
+blaude doctor            # start here: claude CLI, backends, tool support, context cap
 blaude use               # list local models, pick one
 blaude route auto        # Claude does the work while you have allowance
-blaude doctor            # backends, tool support, context cap, allowance
 blaude status            # where each kind of request goes right now
 blaude                   # start a session
 ```
+
+Run `blaude doctor` first. It is the one command that tells you whether the
+pieces above are actually in place — and it catches the failure that looks like
+a bad model but is really a bad setting: an Ollama context window too small for
+the 20k-40k token prompts Claude Code sends, which silently truncates your
+system prompt and tool definitions.
 
 `blaude` with no arguments is the normal entry point. It reads your allowance,
 decides whether this session should run on Claude or locally, and launches Claude
