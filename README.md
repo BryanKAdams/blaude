@@ -44,11 +44,30 @@ Code — it sits underneath it. `@file` mentions, slash commands, skills, plugin
 MCP servers, hooks, shift+tab permission modes, images, `/resume`: all unchanged.
 Tools still execute in your working directory. Only the model changes.
 
+## Install
+
+Blaude needs Node 20 or newer, and the `claude` CLI already logged in.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/BryanKAdams/blaude/main/install.sh | bash
+```
+
+That unpacks the latest release into `~/.blaude/versions/<version>` and links
+`blaude` into `~/.local/bin`. Because every version keeps its own directory,
+`blaude update` is a symlink swap and `blaude update --rollback` is instant.
+
+To run from a clone instead — the right choice if you intend to hack on it:
+
+```bash
+git clone https://github.com/BryanKAdams/blaude.git
+cd blaude
+npm test                                          # no dependencies to install
+ln -s "$PWD/bin/blaude.mjs" ~/.local/bin/blaude   # anywhere on your PATH
+```
+
 ## Quick start
 
 ```bash
-ln -s "$PWD/bin/blaude.mjs" ~/.local/bin/blaude   # anywhere on your PATH
-
 blaude use               # list local models, pick one
 blaude route auto        # Claude does the work while you have allowance
 blaude doctor            # backends, tool support, context cap, allowance

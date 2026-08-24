@@ -18,8 +18,28 @@
     "bin",
     "src",
     "blaude.config.example.json",
-    "README.md"
+    "README.md",
+    "LICENSE",
+    "install.sh"
   ],
   "license": "MIT",
-  "private": true
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/BryanKAdams/blaude.git"
+  },
+  "homepage": "https://github.com/BryanKAdams/blaude#readme",
+  "bugs": {
+    "url": "https://github.com/BryanKAdams/blaude/issues"
+  },
+  "author": "Bryan Adams",
+  "keywords": [
+    "claude",
+    "claude-code",
+    "anthropic",
+    "ollama",
+    "mlx",
+    "local-llm",
+    "gateway",
+    "proxy"
+  ]
 }
