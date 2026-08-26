@@ -85,7 +85,7 @@ To run from a clone instead — the right choice if you intend to hack on it:
 git clone https://github.com/BryanKAdams/blaude.git
 cd blaude
 npm install                                       # dev only: the type checker
-npm test                                          # types + 123 tests
+npm test                                          # types + 126 tests
 ln -s "$PWD/bin/blaude.mjs" ~/.local/bin/blaude   # anywhere on your PATH
 ```
 
@@ -236,6 +236,13 @@ MLX is the better backend for a large model on Apple Silicon: it uses the model'
 own context length instead of a daemon-wide cap, and unified memory means no
 separate VRAM budget.
 
+`thinking` controls what Claude Code sees after a local model answers. It does
+not disable the model's reasoning by itself. The shipped `localThinking: false`
+keeps the fast default; set it to `null` to let Ollama use its native default,
+or to `true` or a supported level such as `low`, `medium`, `high`, or `max` to
+control reasoning explicitly. Anthropic request-level thinking controls take
+effect automatically when `localThinking` is `null`.
+
 ### Which model
 
 What worked best on an M4 Pro / 48 GB, by a wide margin:
@@ -298,6 +305,10 @@ log rather than mistaking for a bad model:
   `500 {"error":"Post .../v1/completions: EOF"}` after minutes of work. If a turn
   runs long, `grep 500 ~/.blaude/gateway.log` tells you whether you are watching
   a slow prefill or a crash.
+- **Newer Claude Code builds can put a `system` message in the middle of the
+  conversation.** Strict Ollama templates reject that with `system message must
+  be at the beginning`; Blaude coalesces those messages into the leading system
+  prompt before translation.
 
 ## What we measured
 
@@ -417,7 +428,7 @@ with commentary.
 
 ```bash
 npm install     # dev only: TypeScript, for the JSDoc check
-npm test        # typecheck + 123 tests, no network
+npm test        # typecheck + 126 tests, no external network
 npm run typecheck
 ```
 

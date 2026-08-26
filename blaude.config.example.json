@@ -63,6 +63,8 @@
 
   "//thinking": "strip drops reasoning traces; text folds them into the reply.",
   "thinking": "strip",
+  "//localThinking": "false keeps the fast default; null lets Ollama choose its default; true or low/medium/high/max enables reasoning. Explicit request controls win when null.",
+  "localThinking": false,
   "textToolCalls": true,
 
   "contextFit": { "enabled": true, "reserveOutput": 4096, "maxToolResultChars": 4000 },

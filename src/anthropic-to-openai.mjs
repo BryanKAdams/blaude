@@ -128,6 +128,23 @@ export function convertMessages(messages, { thinking = 'strip' } = {}) {
   return out;
 }
 
+/**
+ * Ollama's chat templates generally require system messages to appear first.
+ * Recent Claude Code builds can put a system-role message in the middle of the
+ * conversation (for example, an updated list of available agent types). Keep
+ * the content, but coalesce every system message into one leading message so a
+ * strict template does not reject the entire request.
+ */
+export function mergeSystemMessages(initialSystem, messages) {
+  const system = [initialSystem, ...messages
+    .filter((m) => m?.role === 'system')
+    .map((m) => m.content)]
+    .filter((text) => typeof text === 'string' && text.trim())
+    .join('\n\n');
+  const rest = messages.filter((m) => m?.role !== 'system');
+  return system ? [{ role: 'system', content: system }, ...rest] : rest;
+}
+
 /** A single text part is nicer to servers as a plain string. */
 function simplify(parts) {
   if (parts.length === 1 && parts[0].type === 'text') return parts[0].text;
@@ -169,8 +186,7 @@ export function anthropicToOpenAI(body, route, cfg = {}) {
 
   const messages = [];
   const system = flattenSystem(body.system);
-  if (system) messages.push({ role: 'system', content: system });
-  messages.push(...convertMessages(body.messages, { thinking: cfg.thinking }));
+  messages.push(...mergeSystemMessages(system, convertMessages(body.messages, { thinking: cfg.thinking })));
 
   if (!messages.some((m) => m.role !== 'system')) {
     throw new TranslateError('Request contains no user or assistant content');
@@ -191,6 +207,7 @@ export function anthropicToOpenAI(body, route, cfg = {}) {
   const temperature = body.temperature ?? route.temperature;
   if (temperature != null) req.temperature = temperature;
   if (body.top_p != null) req.top_p = body.top_p;
+  if (body.top_k != null) req.top_k = body.top_k;
   if (Array.isArray(body.stop_sequences) && body.stop_sequences.length) req.stop = body.stop_sequences;
 
   const tools = convertTools(body.tools);

@@ -99,7 +99,7 @@ export function createGateway(cfg) {
       // the previous model while every other signal said it had switched.
       const signature = (c, pol) => JSON.stringify([
         pol, c.defaultModel, c.models, c.backends, c.routes,
-        c.thinking, c.textToolCalls, c.contextFit, c.localSession, c.localToolPolicy,
+        c.thinking, c.localThinking, c.textToolCalls, c.contextFit, c.localSession, c.localToolPolicy,
       ]);
       if (signature(next, nextPolicy) === signature(cfg, state.policy)) return false;
 
@@ -347,7 +347,7 @@ async function handleMessages({ cfg, log, counters, policy, meter, affinity, req
         // num_ctx is clamped by the daemon's own OLLAMA_CONTEXT_LENGTH, so this
         // asks for what we want and `blaude ollama context` raises the ceiling.
         numCtx: route.maxContext || null,
-        think: cfg.thinking === 'text',
+        think: ollamaThinking(localBody, cfg),
       })
     : openaiReq;
   const controller = new AbortController();
@@ -447,6 +447,25 @@ export function isEmptyCompletion(completion) {
   if (msg.tool_calls?.length) return false;
   const text = typeof msg.content === 'string' ? msg.content : '';
   return text.trim() === '';
+}
+
+/**
+ * Map Anthropic's thinking controls onto Ollama's native `think` field.
+ * `thinking` is intentionally not consulted here: it controls presentation of
+ * a trace, not whether the local model gets to use reasoning in the first place.
+ */
+function ollamaThinking(body, cfg) {
+  if (cfg.localThinking !== null && cfg.localThinking !== undefined) return cfg.localThinking;
+
+  const type = body?.thinking?.type;
+  if (type === 'disabled') return false;
+  if (type === 'enabled') return true;
+
+  const effort = String(body?.output_config?.effort || '').trim().toLowerCase();
+  if (effort === 'none') return false;
+  if (effort === 'xhigh') return 'high';
+  if (['low', 'medium', 'high', 'max'].includes(effort)) return effort;
+  return null;
 }
 
 async function relayStream({ cfg, log, counters, req, res, body, route, upstream, inputEstimate, t0, onClose, decision, isOllama = false, contextLimit = null, openUpstream = null }) {
@@ -690,7 +709,7 @@ async function serveLocalFallback({ cfg, log, req, res, body, route, openaiReq, 
     method: 'POST',
     headers: { 'content-type': 'application/json', ...(route.backend.apiKey ? { authorization: `Bearer ${route.backend.apiKey}` } : {}) },
     body: JSON.stringify(isOllama
-      ? toOllamaRequest(payload, { numCtx: route.maxContext || null, think: cfg.thinking === 'text' })
+      ? toOllamaRequest(payload, { numCtx: route.maxContext || null, think: ollamaThinking(body, cfg) })
       : payload),
   }).catch((e) => { throw new TranslateError(`local fallback failed too: ${e.message}`, { status: 502 }); });
 

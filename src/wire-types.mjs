@@ -20,9 +20,12 @@
  * @property {boolean} [stream]
  * @property {number} [temperature]
  * @property {number} [top_p]
+ * @property {number} [top_k]
  * @property {string[]} [stop_sequences]
  * @property {Array<AnthropicTool>} [tools]
  * @property {{type: string, name?: string}} [tool_choice]
+ * @property {{type?: string, budget_tokens?: number}} [thinking]
+ * @property {{effort?: string}} [output_config]
  * @property {object} [metadata]
  */
 
@@ -74,6 +77,7 @@
  * @property {boolean} [stream]
  * @property {number} [temperature]
  * @property {number} [top_p]
+ * @property {number} [top_k]
  * @property {string[]} [stop]
  * @property {Array<object>} [tools]
  * @property {string|object} [tool_choice]

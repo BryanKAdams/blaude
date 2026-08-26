@@ -16,7 +16,7 @@ import { randomBytes } from 'node:crypto';
 const toolCallId = () => `call_${randomBytes(8).toString('hex')}`;
 
 /** OpenAI-shaped request -> Ollama /api/chat body. */
-export function toOllamaRequest(openaiReq, { numCtx = null, think = false } = {}) {
+export function toOllamaRequest(openaiReq, { numCtx = null, think = null } = {}) {
   // Ollama labels a tool result with the tool's NAME. An OpenAI-shaped `tool`
   // message carries only the call id, so recover the name from the assistant turn
   // that made the call — sending the id put `toolu_01ABC…` where the model
@@ -68,6 +68,7 @@ export function toOllamaRequest(openaiReq, { numCtx = null, think = false } = {}
   if (numCtx) options.num_ctx = numCtx;
   if (openaiReq.temperature != null) options.temperature = openaiReq.temperature;
   if (openaiReq.top_p != null) options.top_p = openaiReq.top_p;
+  if (openaiReq.top_k != null) options.top_k = openaiReq.top_k;
   if (openaiReq.max_tokens != null) options.num_predict = openaiReq.max_tokens;
   if (openaiReq.stop) options.stop = Array.isArray(openaiReq.stop) ? openaiReq.stop : [openaiReq.stop];
 
@@ -78,8 +79,10 @@ export function toOllamaRequest(openaiReq, { numCtx = null, think = false } = {}
     options,
   };
   if (openaiReq.tools?.length) body.tools = openaiReq.tools;
-  // Reasoning models: keep traces out of the response unless asked for.
-  if (think === false) body.think = false;
+  // `null` leaves the model's native default alone. `false` is an explicit
+  // request to disable reasoning; true and level strings are supported by
+  // Ollama's native API for thinking-capable models.
+  if (think !== null && think !== undefined) body.think = think;
   return body;
 }
 

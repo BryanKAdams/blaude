@@ -129,6 +129,19 @@ test('a non-streaming request returns a valid Anthropic message', async () => {
   assert.equal(call.body.model, 'stub-large');
   assert.equal(call.body.messages[0].role, 'system');
   assert.equal(call.body.options.num_ctx, 32768, 'the context request must be passed through');
+  assert.equal(call.body.think, false, 'the shipped default keeps the fast Ollama path');
+});
+
+test('Anthropic thinking controls reach Ollama without changing presentation mode', async () => {
+  resetStub();
+  gateway.blaude.cfg.localThinking = null;
+  await post('/v1/messages', {
+    model: 'claude-sonnet-5', max_tokens: 100,
+    thinking: { type: 'enabled', budget_tokens: 2048 },
+    messages: [{ role: 'user', content: 'reason this through' }],
+  });
+  assert.equal(chatCalls()[0].body.think, true);
+  gateway.blaude.cfg.localThinking = false;
 });
 
 test('a streaming request emits a well-formed Anthropic event sequence', async () => {

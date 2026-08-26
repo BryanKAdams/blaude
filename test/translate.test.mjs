@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { anthropicToOpenAI, convertMessages, flattenSystem, convertTools, convertToolChoice } from '../src/anthropic-to-openai.mjs';
 import { openAIToAnthropic, mapStopReason } from '../src/openai-to-anthropic.mjs';
+import { toOllamaRequest } from '../src/ollama-backend.mjs';
 
 const route = { model: 'local-model', maxOutput: 8192 };
 
@@ -29,6 +30,24 @@ test('tool_result blocks become standalone tool messages in order', () => {
   assert.equal(messages[1].tool_call_id, 'tu1');
   assert.equal(messages[2].role, 'user');
   assert.equal(messages[2].content, 'and now?');
+});
+
+test('mid-conversation system messages are coalesced at the front', () => {
+  const req = anthropicToOpenAI({
+    model: 'x',
+    system: 'base instructions',
+    messages: [
+      { role: 'user', content: 'first' },
+      { role: 'system', content: [{ type: 'text', text: 'new agent context' }] },
+      { role: 'user', content: 'second' },
+    ],
+  }, route);
+
+  assert.deepEqual(req.messages, [
+    { role: 'system', content: 'base instructions\n\nnew agent context' },
+    { role: 'user', content: 'first' },
+    { role: 'user', content: 'second' },
+  ]);
 });
 
 test('base64 images become data URLs and survive tool results', () => {
@@ -68,6 +87,14 @@ test('max_tokens is clamped by the route ceiling', () => {
     { model: 'm', maxOutput: 4096 },
   );
   assert.equal(req.max_tokens, 4096);
+});
+
+test('top_k survives the Anthropic-to-Ollama translation', () => {
+  const openai = anthropicToOpenAI({
+    model: 'x', top_k: 40, messages: [{ role: 'user', content: 'hi' }],
+  }, route);
+  assert.equal(openai.top_k, 40);
+  assert.equal(toOllamaRequest(openai).options.top_k, 40);
 });
 
 test('a request with no usable content is rejected', () => {

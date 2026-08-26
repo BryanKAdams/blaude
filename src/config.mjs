@@ -51,6 +51,14 @@ export const DEFAULTS = {
   //   text  -> fold them into the visible text
   thinking: 'strip',
 
+  // Whether Ollama should reason before answering. false keeps the fast,
+  // existing default; null lets the model use its own default; true or
+  // low/medium/high/max enables a supported level. An explicit Anthropic
+  // thinking/output_config request wins when this is null. This is separate
+  // from `thinking`, which only controls what happens to a trace after it comes
+  // back.
+  localThinking: false,
+
   // Parse `<tool_call>{...}</tool_call>` emitted as plain text by models whose
   // server-side tool support is weak or absent.
   textToolCalls: true,
