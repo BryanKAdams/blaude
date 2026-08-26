@@ -1,6 +1,6 @@
 {
   "name": "blaude",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Local-first gateway that lets Claude Code drive a local model over the Anthropic wire protocol, escalating to Claude only when you ask.",
   "type": "module",
   "bin": {
