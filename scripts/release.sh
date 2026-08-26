@@ -118,10 +118,20 @@ PREV_TAG="$(git tag --sort=-v:refname | head -1)"
   echo '## Install'
   echo
   echo '```bash'
-  echo "gh release download $TAG --repo $REPO --pattern install.sh -O - | bash"
+  # The plain curl form, matching the README. The gh form below is the fallback
+  # for a private fork, where raw.githubusercontent is not readable anonymously
+  # — it used to be the only line here, which asked every public user to install
+  # gh for no reason.
+  echo "curl -fsSL https://raw.githubusercontent.com/$REPO/main/install.sh | bash"
   echo '```'
   echo
   echo 'Already installed? `blaude update`'
+  echo
+  echo "From a private fork, where the raw URL needs auth:"
+  echo
+  echo '```bash'
+  echo "gh release download $TAG --repo $REPO --pattern install.sh -O - | bash"
+  echo '```'
 } > "$NOTES_FILE"
 
 # The tag has to point at a commit whose package.json says $VERSION: that file
